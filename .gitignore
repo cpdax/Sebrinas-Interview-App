@@ -1,0 +1,8 @@
+# Internal planning docs — not deployed
+requirements.md
+
+# Streamlit secrets — never commit real values
+.streamlit/secrets.toml
+
+# Mac junk
+.DS_Store

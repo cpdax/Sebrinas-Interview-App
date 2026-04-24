@@ -1,17 +1,15 @@
-# Sebrina's Interview App
+# Customer Interview Notes App
 
-A mobile-friendly Streamlit app for capturing customer conversation notes. Saves to SharePoint — one list per product line (Procare / ChildPlus).
-
-Built by Dax Collins, Procare Product Operations. Related Aha! item: [PRODOPS-22](https://procaresoftware.aha.io/features/PRODOPS-22)
+A mobile-friendly Streamlit app for capturing customer conversation notes. Saves to SharePoint — routing determined by a destination field in the form.
 
 ---
 
 ## What it does
 
-- Simple form: contact name, org, role, destination (Procare or ChildPlus), event source, notes
+- Simple form: contact name, org, role, destination, event source, notes
 - In-browser audio recording with Web Speech API transcription — tap to record, copy to notes
 - Saves each entry as a row in a SharePoint list, routing by destination
-- Falls back to a CSV download if SharePoint isn't configured (useful for demos)
+- Falls back to a CSV download if SharePoint isn't configured (useful for demos/prototyping)
 
 ---
 
@@ -20,7 +18,7 @@ Built by Dax Collins, Procare Product Operations. Related Aha! item: [PRODOPS-22
 ```bash
 pip install -r requirements.txt
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml
-# Fill in your Azure AD credentials in secrets.toml
+# Fill in your values in secrets.toml
 streamlit run app.py
 ```
 
@@ -28,81 +26,59 @@ streamlit run app.py
 
 ## Deploying to Streamlit Community Cloud
 
-1. Push this repo to GitHub (private repo is fine)
+1. Push this repo to GitHub
 2. Go to [share.streamlit.io](https://share.streamlit.io) → New app → select repo + `app.py`
 3. In **Advanced settings → Secrets**, paste the contents of your filled-in `secrets.toml`
 4. Deploy
 
 ---
 
-## SharePoint setup — what you need
+## Configuration — secrets.toml
 
-The app auto-creates the SharePoint lists on first save. You just need an Azure AD app registration with the right permissions.
-
-### Step 1 — Register an Azure AD app
-
-1. Go to [portal.azure.com](https://portal.azure.com) → **Azure Active Directory → App registrations → New registration**
-2. Name: `Sebrina Interview App` (or anything)
-3. Supported account types: **Single tenant**
-4. No redirect URI needed
-5. Click **Register**
-
-### Step 2 — Add API permissions
-
-In the new app registration:
-1. **API permissions → Add a permission → Microsoft Graph → Application permissions**
-2. Add: `Sites.ReadWrite.All`
-3. Click **Grant admin consent** (requires Global Admin or SharePoint Admin)
-
-### Step 3 — Create a client secret
-
-1. **Certificates & secrets → New client secret**
-2. Copy the **Value** immediately (you can't see it again)
-
-### Step 4 — Fill in secrets.toml
+All configuration lives in Streamlit secrets. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill in:
 
 ```toml
-TENANT_ID = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"   # Azure AD → Overview → Tenant ID
-CLIENT_ID = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"   # App registration → Overview → Application (client) ID
-CLIENT_SECRET = "your-client-secret-value"
+# Azure AD app registration (for SharePoint write access)
+TENANT_ID = "your-azure-tenant-id"
+CLIENT_ID = "your-azure-app-client-id"
+CLIENT_SECRET = "your-azure-app-client-secret"
+
+# SharePoint routing
+SHAREPOINT_HOSTNAME = "yourcompany.sharepoint.com"
+PROCARE_SITE_PATH = "/sites/your-procare-site"
+CHILDPLUS_SITE_PATH = "/sites/your-childplus-site"
+LIST_NAME = "your-list-name"
 ```
 
-### What the app creates on first save
-
-| Destination | SharePoint Site | List Name |
-|-------------|----------------|-----------|
-| Procare | `procaresoftwarellc.sharepoint.com/sites/ProductManagement` | Customer Interview Notes - Sebrina |
-| ChildPlus | `procaresoftwarellc.sharepoint.com/sites/ProductManagement-childplus` | Customer Interview Notes - Sebrina |
-
-List columns: Contact Name, Organization, Role, Destination, Event Source, Notes, Submitted At
+The app auto-creates the SharePoint list on first save — no manual list setup needed.
 
 ---
 
-## Audio recording notes
+## SharePoint setup — Azure AD app registration
 
-- Uses the browser's built-in Web Speech API — no API key or external service needed
-- Works on iPhone Safari (requires microphone permission on first use)
-- Transcription is editable before saving
-- **In noisy environments**: speak clearly and close to the phone mic. Upgrade to Whisper API (v2) for better accuracy.
+1. Go to [portal.azure.com](https://portal.azure.com) → **Azure Active Directory → App registrations → New registration**
+2. Name it anything, single tenant, no redirect URI → **Register**
+3. **API permissions → Add → Microsoft Graph → Application permissions → `Sites.ReadWrite.All`**
+4. Click **Grant admin consent** (requires Global Admin or SharePoint Admin)
+5. **Certificates & secrets → New client secret** — copy the value immediately
 
 ---
 
-## Roadmap
+## Audio recording
 
-See `requirements.md` for full backlog. Near-term v2 items:
-- Zoom transcript auto-import
-- Auth / login for multi-user
-- Whisper transcription for noisy environments
+- Uses the browser's built-in Web Speech API — no API key needed
+- Works on iPhone Safari (prompts for microphone permission on first use)
+- Transcription appears in the recording component; tap "Copy to notes" to paste it into the notes field
+- For noisy environments (conference floors, booths): hold phone close to speaker, speak clearly
 
 ---
 
 ## Repo structure
 
 ```
-app.py                    Main Streamlit app
-requirements.txt          Python dependencies
+app.py                        Main Streamlit app
+requirements.txt              Python dependencies
 README.md
 .streamlit/
-  secrets.toml.example    Template — copy to secrets.toml and fill in
-requirements.md           Full requirements & backlog (not deployed)
+  secrets.toml.example        Template — copy to secrets.toml and fill in
 ```

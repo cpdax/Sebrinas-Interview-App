@@ -1,49 +1,45 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import requests
-import json
 from datetime import datetime
 
 # ─────────────────────────────────────────────
-# CONFIG
+# STATIC OPTIONS (no internal info here)
 # ─────────────────────────────────────────────
 
-DESTINATIONS = {
-    "Procare": {
-        "site_hostname": "procaresoftwarellc.sharepoint.com",
-        "site_path": "/sites/ProductManagement",
-        "list_name": "Customer Interview Notes - Sebrina",
-    },
-    "ChildPlus": {
-        "site_hostname": "procaresoftwarellc.sharepoint.com",
-        "site_path": "/sites/ProductManagement-childplus",
-        "list_name": "Customer Interview Notes - Sebrina",
-    },
-}
-
+DESTINATION_OPTIONS = ["Procare", "ChildPlus"]
 SOURCE_OPTIONS = ["Conference", "Site Visit", "Zoom", "Other"]
 
 # ─────────────────────────────────────────────
 # SHAREPOINT / GRAPH API HELPERS
 # ─────────────────────────────────────────────
 
-def get_graph_token() -> str | None:
-    """Acquire an app-only Microsoft Graph token via client credentials flow."""
+def get_sharepoint_config() -> dict | None:
+    """Load SharePoint connection config from Streamlit secrets. Returns None if not configured."""
     try:
-        tenant_id = st.secrets["TENANT_ID"]
-        client_id = st.secrets["CLIENT_ID"]
-        client_secret = st.secrets["CLIENT_SECRET"]
+        return {
+            "tenant_id":         st.secrets["TENANT_ID"],
+            "client_id":         st.secrets["CLIENT_ID"],
+            "client_secret":     st.secrets["CLIENT_SECRET"],
+            "hostname":          st.secrets["SHAREPOINT_HOSTNAME"],
+            "procare_site_path": st.secrets["PROCARE_SITE_PATH"],
+            "childplus_site_path": st.secrets["CHILDPLUS_SITE_PATH"],
+            "list_name":         st.secrets["LIST_NAME"],
+        }
     except (KeyError, FileNotFoundError):
         return None
 
-    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+
+def get_graph_token(cfg: dict) -> str | None:
+    """Acquire an app-only Microsoft Graph token via client credentials flow."""
+    url = f"https://login.microsoftonline.com/{cfg['tenant_id']}/oauth2/v2.0/token"
     resp = requests.post(
         url,
         data={
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "scope": "https://graph.microsoft.com/.default",
+            "grant_type":    "client_credentials",
+            "client_id":     cfg["client_id"],
+            "client_secret": cfg["client_secret"],
+            "scope":         "https://graph.microsoft.com/.default",
         },
         timeout=10,
     )
@@ -55,8 +51,11 @@ def get_graph_token() -> str | None:
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_site_id(hostname: str, site_path: str, token: str) -> str | None:
     """Resolve a SharePoint site URL to its Graph site ID."""
-    url = f"https://graph.microsoft.com/v1.0/sites/{hostname}:{site_path}"
-    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    resp = requests.get(
+        f"https://graph.microsoft.com/v1.0/sites/{hostname}:{site_path}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
     if resp.ok:
         return resp.json().get("id")
     return None
@@ -67,7 +66,6 @@ def get_or_create_list(site_id: str, list_name: str, token: str) -> str | None:
     """Return the ID of an existing SharePoint list, creating it if absent."""
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # Try to find existing list
     resp = requests.get(
         f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists",
         headers=headers,
@@ -78,14 +76,13 @@ def get_or_create_list(site_id: str, list_name: str, token: str) -> str | None:
             if lst.get("displayName") == list_name:
                 return lst["id"]
 
-    # Create the list
     payload = {
         "displayName": list_name,
         "columns": [
             {"name": "ContactName",  "text": {}},
             {"name": "Organization", "text": {}},
             {"name": "Role",         "text": {}},
-            {"name": "Destination",  "choice": {"choices": ["Procare", "ChildPlus"]}},
+            {"name": "Destination",  "choice": {"choices": DESTINATION_OPTIONS}},
             {"name": "EventSource",  "choice": {"choices": SOURCE_OPTIONS}},
             {"name": "Notes",        "text": {"allowMultipleLines": True}},
             {"name": "SubmittedAt",  "dateTime": {}},
@@ -105,20 +102,23 @@ def get_or_create_list(site_id: str, list_name: str, token: str) -> str | None:
 
 def save_to_sharepoint(form_data: dict) -> tuple[bool, str]:
     """Post one row to the destination SharePoint list. Returns (success, message)."""
-    token = get_graph_token()
-    if not token:
+    cfg = get_sharepoint_config()
+    if not cfg:
         return False, "sharepoint_not_configured"
 
-    dest = form_data["destination"]
-    cfg = DESTINATIONS[dest]
+    token = get_graph_token(cfg)
+    if not token:
+        return False, "Could not acquire Graph token — check Azure AD credentials in secrets"
 
-    site_id = get_site_id(cfg["site_hostname"], cfg["site_path"], token)
+    site_path = cfg["procare_site_path"] if form_data["destination"] == "Procare" else cfg["childplus_site_path"]
+
+    site_id = get_site_id(cfg["hostname"], site_path, token)
     if not site_id:
-        return False, f"Could not resolve site ID for {dest}"
+        return False, "Could not resolve SharePoint site"
 
     list_id = get_or_create_list(site_id, cfg["list_name"], token)
     if not list_id:
-        return False, f"Could not get/create list on {dest}"
+        return False, "Could not get or create SharePoint list"
 
     item_payload = {
         "fields": {
@@ -274,7 +274,6 @@ st.set_page_config(
     layout="centered",
 )
 
-# Inject minimal mobile-friendly CSS
 st.markdown("""
 <style>
   .main > div { max-width: 640px; margin: auto; }
@@ -299,13 +298,11 @@ st.markdown("""
 st.title("🎤 Customer Notes")
 st.caption("Capture a conversation — it takes 30 seconds.")
 
-# ── Session state ──
 if "submitted" not in st.session_state:
     st.session_state.submitted = False
 if "last_entry" not in st.session_state:
     st.session_state.last_entry = None
 
-# ── Success state ──
 if st.session_state.submitted:
     st.markdown('<div class="success-banner">✅ Saved! Ready for the next one.</div>', unsafe_allow_html=True)
     st.write("")
@@ -330,22 +327,19 @@ if st.session_state.submitted:
         )
     st.stop()
 
-# ── Form ──
 with st.form("interview_form", clear_on_submit=True):
     st.subheader("Who did you talk to?")
-    contact_name  = st.text_input("Name *", placeholder="First and last name")
-    organization  = st.text_input("Organization / Agency *", placeholder="e.g. Bright Horizons, Rockford Head Start")
-    role          = st.text_input("Title / Role", placeholder="e.g. Executive Director, Program Coordinator")
+    contact_name = st.text_input("Name *", placeholder="First and last name")
+    organization = st.text_input("Organization / Agency *", placeholder="e.g. Bright Horizons, Rockford Head Start")
+    role         = st.text_input("Title / Role", placeholder="e.g. Executive Director, Program Coordinator")
 
     st.divider()
     st.subheader("Context")
-    destination  = st.selectbox("Destination *", list(DESTINATIONS.keys()), help="Routes your notes to the right SharePoint list")
+    destination  = st.selectbox("Destination *", DESTINATION_OPTIONS, help="Routes your notes to the right SharePoint list")
     event_source = st.selectbox("Where did you meet?", SOURCE_OPTIONS)
 
     st.divider()
     st.subheader("Notes")
-
-    # Audio recorder
     st.markdown("**Record a quote or key point**")
     st.caption("Tap the mic, speak, then copy the transcription into the notes below.")
     components.html(AUDIO_HTML, height=220)
@@ -365,13 +359,13 @@ if submitted:
         st.stop()
 
     form_data = {
-        "contact_name":  contact_name.strip(),
-        "organization":  organization.strip(),
-        "role":          role.strip(),
-        "destination":   destination,
-        "event_source":  event_source,
-        "notes":         notes.strip(),
-        "submitted_at":  datetime.now().isoformat(),
+        "contact_name": contact_name.strip(),
+        "organization": organization.strip(),
+        "role":         role.strip(),
+        "destination":  destination,
+        "event_source": event_source,
+        "notes":        notes.strip(),
+        "submitted_at": datetime.now().isoformat(),
     }
 
     success, message = save_to_sharepoint(form_data)
@@ -381,7 +375,6 @@ if submitted:
         st.session_state.submitted = True
         st.rerun()
     elif message == "sharepoint_not_configured":
-        # Graceful fallback — show download
         form_data["fallback_csv"] = True
         st.session_state.last_entry = form_data
         st.session_state.submitted = True
