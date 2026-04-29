@@ -16,6 +16,9 @@ TICKET_DAYS         = 90
 TICKET_MAX          = 5
 TAG_SIMILARITY      = 0.75  # 75% similarity threshold for "did you mean?"
 
+# HubSpot is only used for ChildPlus. Procare contacts are captured manually.
+HS_DESTINATION = "ChildPlus"
+
 # HubSpot contact properties pulled on every search.
 # Includes ChildPlus-specific identifiers (database_name, license, IKN) so that
 # duplicate / similar contacts can be visually disambiguated by the user.
@@ -26,16 +29,6 @@ HS_CONTACT_PROPS = [
 
 NOTES_LIST_NAME = {"Procare": "PROCARE_NOTES_LIST", "ChildPlus": "CHILDPLUS_NOTES_LIST"}
 TAGS_LIST_NAME  = {"Procare": "PROCARE_TAGS_LIST",  "ChildPlus": "CHILDPLUS_TAGS_LIST"}
-
-# Solo-mode widget keys — these are the source of truth for the contact form.
-# When a HubSpot result is selected, we write to these keys directly so the
-# text inputs reflect the auto-filled values on the next rerun.
-SOLO_FIELD_KEYS = {
-    "name":     "solo_name",
-    "agency":   "solo_agency",
-    "role":     "solo_role",
-    "database": "solo_database",  # internal — not bound to a visible widget
-}
 
 
 # ─────────────────────────────────────────────
@@ -575,20 +568,20 @@ st.markdown("""
 
 def init_state():
     defaults = {
-        "mode":            None,       # None | "solo" | "group"
+        "destination":     None,        # None | "Procare" | "ChildPlus" — chosen first
+        "mode":            None,        # None | "solo" | "group" — chosen second
         "session_id":      str(uuid.uuid4()),
-        "contacts":        [],          # list of dicts: {name, agency, role, database, hs_id, hs_data}
+        "contacts":        [],
         "solo_search_run": False,
         "solo_results":    None,
-        "solo_hs_id":      None,        # currently-selected HubSpot contact ID
-        "solo_hs_data":    None,        # full HubSpot record for selected contact
-        "solo_hs_tickets": None,        # tickets for selected contact
+        "solo_hs_id":      None,
+        "solo_hs_data":    None,
+        "solo_hs_tickets": None,
         "group_search_run": False,
         "group_results":   None,
         "group_agency":    "",
         "group_manual_name":   "",
         "group_manual_role":   "",
-        "destination":     DESTINATION_OPTIONS[0],
         "event_source":    SOURCE_OPTIONS[0],
         "notes":           [{"text": "", "timestamp": datetime.now().isoformat()}],
         "tags":            [],
@@ -596,7 +589,7 @@ def init_state():
         "pending_similar_tag": None,
         "submitted":       False,
         "last_entry":      None,
-        # Solo-mode contact fields — these are the source of truth
+        # Solo-mode contact fields — single source of truth
         "solo_name":       "",
         "solo_agency":     "",
         "solo_role":       "",
@@ -617,8 +610,7 @@ def reset_all():
 
 
 def build_solo_contact() -> dict:
-    """Read the solo contact's current state from session_state widget keys.
-    Single source of truth — used for both display and validation."""
+    """Read the solo contact's current state from session_state widget keys."""
     return {
         "name":     st.session_state.get("solo_name", "").strip(),
         "agency":   st.session_state.get("solo_agency", "").strip(),
@@ -673,11 +665,33 @@ if st.session_state.submitted:
 
 
 # ─────────────────────────────────────────────
-# STEP 1 — MODE SELECTOR
+# STEP 1 — DESTINATION (product line)
+# ─────────────────────────────────────────────
+
+if st.session_state.destination is None:
+    st.caption("Step 1 of 2 — Which product line?")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown('<div class="mode-card">', unsafe_allow_html=True)
+        if st.button("🏢 Procare\n\n*Procare contacts and notes*", use_container_width=True, key="pick_procare"):
+            st.session_state.destination = "Procare"
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+    with col2:
+        st.markdown('<div class="mode-card">', unsafe_allow_html=True)
+        if st.button("🧒 ChildPlus\n\n*ChildPlus contacts and notes*", use_container_width=True, key="pick_childplus"):
+            st.session_state.destination = "ChildPlus"
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+    st.stop()
+
+
+# ─────────────────────────────────────────────
+# STEP 2 — MODE (solo or group)
 # ─────────────────────────────────────────────
 
 if st.session_state.mode is None:
-    st.caption("What are you capturing?")
+    st.caption(f"📋 {st.session_state.destination}  ·  Step 2 of 2 — What are you capturing?")
     col1, col2 = st.columns(2)
     with col1:
         st.markdown('<div class="mode-card">', unsafe_allow_html=True)
@@ -691,14 +705,26 @@ if st.session_state.mode is None:
             st.session_state.mode = "group"
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
+
+    # Allow going back to step 1 from step 2
+    st.write("")
+    if st.button("← Back to product line"):
+        st.session_state.destination = None
+        st.rerun()
     st.stop()
 
 
-# Mode ribbon
-mode_label = "Solo conversation" if st.session_state.mode == "solo" else "Group conversation"
+# ─────────────────────────────────────────────
+# RIBBON — both selections + change button
+# ─────────────────────────────────────────────
+
+mode_label   = "Solo conversation" if st.session_state.mode == "solo" else "Group conversation"
+ribbon_text  = f"{st.session_state.destination}  ·  {mode_label}"
+hs_available = st.session_state.destination == HS_DESTINATION
+
 col_a, col_b = st.columns([4, 1])
 with col_a:
-    st.markdown(f'<div class="mode-label">{mode_label}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="mode-label">{ribbon_text}</div>', unsafe_allow_html=True)
 with col_b:
     if st.button("← Change", use_container_width=True):
         reset_all()
@@ -706,7 +732,7 @@ with col_b:
 
 
 # ─────────────────────────────────────────────
-# STEP 2 — CONTACT(S)
+# STEP 3 — CONTACT(S)
 # ─────────────────────────────────────────────
 
 st.divider()
@@ -716,9 +742,6 @@ hs_token = get_hubspot_token()
 if st.session_state.mode == "solo":
     st.subheader("Who did you talk to?")
 
-    # Text inputs read from session_state via their keys (no `value=` argument).
-    # When HubSpot auto-fill writes to st.session_state["solo_agency"] etc., the
-    # widget picks up the new value on the next rerun automatically.
     colA, colB = st.columns([1, 1])
     with colA:
         st.text_input("Name *", placeholder="First and last name", key="solo_name")
@@ -727,76 +750,78 @@ if st.session_state.mode == "solo":
 
     st.text_input("Title / Role", placeholder="e.g. Executive Director", key="solo_role")
 
-    # HubSpot lookup
-    with st.container():
-        h1, h2 = st.columns([4, 1])
-        with h1:
-            st.markdown("**🔍 HubSpot Lookup** *(optional)*")
-            if not hs_token:
-                st.caption("HubSpot not configured.")
+    # HubSpot lookup — only available for ChildPlus
+    if hs_available:
+        with st.container():
+            h1, h2 = st.columns([4, 1])
+            with h1:
+                st.markdown("**🔍 HubSpot Lookup** *(optional)*")
+                if not hs_token:
+                    st.caption("HubSpot not configured.")
+                else:
+                    st.caption("Find existing contact to pre-fill and load support history.")
+            with h2:
+                can_search = hs_token and (
+                    st.session_state.solo_name.strip() or st.session_state.solo_agency.strip()
+                )
+                if st.button("Search", disabled=not can_search, use_container_width=True, key="solo_search"):
+                    with st.spinner("Searching HubSpot…"):
+                        st.session_state.solo_results = search_hubspot_contacts(
+                            st.session_state.solo_name,
+                            st.session_state.solo_agency,
+                            hs_token,
+                        )
+                        st.session_state.solo_search_run = True
+
+        if st.session_state.solo_search_run:
+            results = st.session_state.solo_results or []
+            if not results:
+                st.info("No match identified")
             else:
-                st.caption("Find existing contact to pre-fill and load support history.")
-        with h2:
-            can_search = hs_token and (
-                st.session_state.solo_name.strip() or st.session_state.solo_agency.strip()
-            )
-            if st.button("Search", disabled=not can_search, use_container_width=True, key="solo_search"):
-                with st.spinner("Searching HubSpot…"):
-                    st.session_state.solo_results = search_hubspot_contacts(
-                        st.session_state.solo_name,
-                        st.session_state.solo_agency,
-                        hs_token,
-                    )
-                    st.session_state.solo_search_run = True
+                if len(results) > 1:
+                    st.caption(f"**{len(results)} possible matches** — sorted alphabetically by last name. Each card shows agency, database, email, and role to help you pick the right record.")
 
-    if st.session_state.solo_search_run:
-        results = st.session_state.solo_results or []
-        if not results:
-            st.info("No match identified")
-        else:
-            if len(results) > 1:
-                st.caption(f"**{len(results)} possible matches** — sorted alphabetically by last name. Each card shows agency, database, email, and role to help you pick the right record.")
-
-            current_id = st.session_state.solo_hs_id
-            for r in results:
-                p = r["properties"]
-                is_selected = (r["id"] == current_id)
-                with st.container(border=True):
-                    cc1, cc2 = st.columns([5, 1])
-                    with cc1:
-                        st.markdown(render_contact_card(p))
-                    with cc2:
-                        if is_selected:
-                            st.success("Selected")
-                            if st.button("Clear", key=f"clr_{r['id']}", use_container_width=True):
-                                st.session_state.solo_hs_id      = None
-                                st.session_state.solo_hs_data    = None
-                                st.session_state.solo_hs_tickets = None
-                                st.rerun()
-                        else:
-                            if st.button("Use this", key=f"use_{r['id']}", use_container_width=True, type="primary"):
-                                # Write to widget keys directly so the text inputs reflect
-                                # the auto-filled values on rerun. This is the canonical
-                                # Streamlit pattern for "auto-fill a form."
-                                full_name = f"{p.get('firstname','')} {p.get('lastname','')}".strip()
-                                if full_name:
-                                    st.session_state.solo_name = full_name
-                                if p.get("company"):
-                                    st.session_state.solo_agency = p["company"]
-                                if p.get("jobtitle"):
-                                    st.session_state.solo_role = p["jobtitle"]
-                                st.session_state.solo_database = p.get("database_name") or ""
-                                st.session_state.solo_hs_id    = r["id"]
-                                st.session_state.solo_hs_data  = r
-                                with st.spinner("Loading HubSpot history…"):
-                                    st.session_state.solo_hs_tickets = get_contact_tickets(r["id"], hs_token)
-                                st.rerun()
+                current_id = st.session_state.solo_hs_id
+                for r in results:
+                    p = r["properties"]
+                    is_selected = (r["id"] == current_id)
+                    with st.container(border=True):
+                        cc1, cc2 = st.columns([5, 1])
+                        with cc1:
+                            st.markdown(render_contact_card(p))
+                        with cc2:
+                            if is_selected:
+                                st.success("Selected")
+                                if st.button("Clear", key=f"clr_{r['id']}", use_container_width=True):
+                                    st.session_state.solo_hs_id      = None
+                                    st.session_state.solo_hs_data    = None
+                                    st.session_state.solo_hs_tickets = None
+                                    st.rerun()
+                            else:
+                                if st.button("Use this", key=f"use_{r['id']}", use_container_width=True, type="primary"):
+                                    full_name = f"{p.get('firstname','')} {p.get('lastname','')}".strip()
+                                    if full_name:
+                                        st.session_state.solo_name = full_name
+                                    if p.get("company"):
+                                        st.session_state.solo_agency = p["company"]
+                                    if p.get("jobtitle"):
+                                        st.session_state.solo_role = p["jobtitle"]
+                                    st.session_state.solo_database = p.get("database_name") or ""
+                                    st.session_state.solo_hs_id    = r["id"]
+                                    st.session_state.solo_hs_data  = r
+                                    with st.spinner("Loading HubSpot history…"):
+                                        st.session_state.solo_hs_tickets = get_contact_tickets(r["id"], hs_token)
+                                    st.rerun()
 
 
 # ── GROUP MODE ──
 else:
     st.subheader("Group setup")
-    st.caption("Start by finding the agency, then add attendees.")
+
+    if hs_available:
+        st.caption("Start by finding the agency, then add attendees.")
+    else:
+        st.caption("Add each person below. Procare contacts are added manually.")
 
     st.session_state.group_agency = st.text_input(
         "Agency / Organization *",
@@ -804,51 +829,57 @@ else:
         placeholder="e.g. Bright Futures Head Start", key="group_agency_input"
     )
 
-    h1, h2 = st.columns([4, 1])
-    with h1:
-        st.markdown("**🔍 Find contacts at this agency**")
-    with h2:
-        can_search_group = hs_token and st.session_state.group_agency.strip()
-        if st.button("Search", disabled=not can_search_group, use_container_width=True, key="group_search"):
-            with st.spinner("Searching HubSpot…"):
-                st.session_state.group_results = search_contacts_by_agency(st.session_state.group_agency, hs_token)
-                st.session_state.group_search_run = True
+    # HubSpot agency search — only for ChildPlus
+    if hs_available:
+        h1, h2 = st.columns([4, 1])
+        with h1:
+            st.markdown("**🔍 Find contacts at this agency**")
+        with h2:
+            can_search_group = hs_token and st.session_state.group_agency.strip()
+            if st.button("Search", disabled=not can_search_group, use_container_width=True, key="group_search"):
+                with st.spinner("Searching HubSpot…"):
+                    st.session_state.group_results = search_contacts_by_agency(st.session_state.group_agency, hs_token)
+                    st.session_state.group_search_run = True
 
-    if st.session_state.group_search_run:
-        results = st.session_state.group_results or []
-        if not results:
-            st.info("No contacts found in HubSpot for that agency. Add people manually below.")
-        else:
-            st.markdown(f"**{len(results)} contact(s) at {st.session_state.group_agency}** — sorted alphabetically by last name:")
-            added_ids = {ct.get("hs_id") for ct in st.session_state.contacts if ct.get("hs_id")}
-            for r in results:
-                p = r["properties"]
-                is_added = r["id"] in added_ids
-                with st.container(border=True):
-                    gcols = st.columns([5, 1])
-                    with gcols[0]:
-                        st.markdown(render_contact_card(p))
-                    with gcols[1]:
-                        if is_added:
-                            st.markdown("✓ Added")
-                        else:
-                            if st.button("+ Add", key=f"add_{r['id']}", use_container_width=True):
-                                with st.spinner("Loading…"):
-                                    tickets = get_contact_tickets(r["id"], hs_token)
-                                st.session_state.contacts.append({
-                                    "name": f"{p.get('firstname','')} {p.get('lastname','')}".strip() or "(no name)",
-                                    "agency": p.get("company") or st.session_state.group_agency,
-                                    "role": p.get("jobtitle","") or "",
-                                    "database": p.get("database_name","") or "",
-                                    "hs_id": r["id"],
-                                    "hs_data": r,
-                                    "hs_tickets": tickets,
-                                })
-                                st.rerun()
+        if st.session_state.group_search_run:
+            results = st.session_state.group_results or []
+            if not results:
+                st.info("No contacts found in HubSpot for that agency. Add people manually below.")
+            else:
+                st.markdown(f"**{len(results)} contact(s) at {st.session_state.group_agency}** — sorted alphabetically by last name:")
+                added_ids = {ct.get("hs_id") for ct in st.session_state.contacts if ct.get("hs_id")}
+                for r in results:
+                    p = r["properties"]
+                    is_added = r["id"] in added_ids
+                    with st.container(border=True):
+                        gcols = st.columns([5, 1])
+                        with gcols[0]:
+                            st.markdown(render_contact_card(p))
+                        with gcols[1]:
+                            if is_added:
+                                st.markdown("✓ Added")
+                            else:
+                                if st.button("+ Add", key=f"add_{r['id']}", use_container_width=True):
+                                    with st.spinner("Loading…"):
+                                        tickets = get_contact_tickets(r["id"], hs_token)
+                                    st.session_state.contacts.append({
+                                        "name": f"{p.get('firstname','')} {p.get('lastname','')}".strip() or "(no name)",
+                                        "agency": p.get("company") or st.session_state.group_agency,
+                                        "role": p.get("jobtitle","") or "",
+                                        "database": p.get("database_name","") or "",
+                                        "hs_id": r["id"],
+                                        "hs_data": r,
+                                        "hs_tickets": tickets,
+                                    })
+                                    st.rerun()
 
-    # Manual add
-    st.divider()
-    st.markdown("**+ Add someone not in HubSpot**")
+        st.divider()
+        st.markdown("**+ Add someone not in HubSpot**")
+    else:
+        st.divider()
+        st.markdown("**+ Add an attendee**")
+
+    # Manual add (always available)
     m1, m2, m3 = st.columns([2, 2, 1])
     with m1:
         manual_name = st.text_input("Name", key="group_manual_name", label_visibility="collapsed", placeholder="Name")
@@ -887,24 +918,19 @@ else:
 
 
 # ─────────────────────────────────────────────
-# STEP 3 — CONTEXT
+# STEP 4 — EVENT SOURCE
 # ─────────────────────────────────────────────
 
 st.divider()
-st.subheader("Context")
-
-c1, c2 = st.columns(2)
-with c1:
-    destination = st.selectbox(
-        "Destination *", DESTINATION_OPTIONS, key="destination",
-        help="Routes to the matching SharePoint list for that product line"
-    )
-with c2:
-    event_source = st.selectbox("Where did you meet?", SOURCE_OPTIONS, key="event_source")
+st.subheader("Where did you meet?")
+st.selectbox(
+    "Where did you meet?", SOURCE_OPTIONS, key="event_source",
+    label_visibility="collapsed",
+)
 
 
 # ─────────────────────────────────────────────
-# STEP 4 — NOTES
+# STEP 5 — NOTES
 # ─────────────────────────────────────────────
 
 st.divider()
@@ -938,12 +964,12 @@ if st.button("+ Add another note", use_container_width=True):
 
 
 # ─────────────────────────────────────────────
-# STEP 5 — TAGS
+# STEP 6 — TAGS
 # ─────────────────────────────────────────────
 
 st.divider()
 st.subheader("Tags")
-st.caption(f"Topics for this session. Separate by product line (Procare vs ChildPlus).")
+st.caption(f"Topics for this session — saved to the {st.session_state.destination} tag list.")
 
 existing_tags = fetch_tags(st.session_state.destination)
 
@@ -1021,7 +1047,7 @@ if st.session_state.pending_similar_tag:
 
 
 # ─────────────────────────────────────────────
-# STEP 6 — SAVE
+# STEP 7 — SAVE
 # ─────────────────────────────────────────────
 
 st.divider()
@@ -1031,8 +1057,6 @@ save_clicked = st.button("💾 Save session", use_container_width=True, key="sav
 st.markdown('</div>', unsafe_allow_html=True)
 
 if save_clicked:
-    # Build the contact list at save time from the canonical source — for solo
-    # mode that's the widget keys, for group it's already in st.session_state.contacts.
     if st.session_state.mode == "solo":
         contacts_to_save = [build_solo_contact()]
     else:
@@ -1076,70 +1100,69 @@ if save_clicked:
 
 
 # ─────────────────────────────────────────────
-# HUBSPOT CONTEXT (BOTTOM)
+# HUBSPOT CONTEXT (BOTTOM) — only when destination = ChildPlus
 # ─────────────────────────────────────────────
 
-# Build the list of contacts with HubSpot data — for solo mode pull from
-# session_state widget keys, for group mode pull from the contacts list.
-hs_contacts = []
-if st.session_state.mode == "solo":
-    if st.session_state.solo_hs_id and st.session_state.solo_hs_data:
-        hs_contacts = [build_solo_contact()]
-else:
-    hs_contacts = [c for c in st.session_state.contacts if c.get("hs_id")]
-
-if hs_contacts:
-    st.divider()
-    st.subheader("📋 HubSpot Context")
-    st.caption("Read-only — not saved with notes. For reference only.")
-
-    if len(hs_contacts) == 1:
-        selected_contact = hs_contacts[0]
+if hs_available:
+    hs_contacts = []
+    if st.session_state.mode == "solo":
+        if st.session_state.solo_hs_id and st.session_state.solo_hs_data:
+            hs_contacts = [build_solo_contact()]
     else:
-        labels = [c["name"] or "(no name)" for c in hs_contacts]
-        pick = st.selectbox("View context for:", labels, key="hs_view_picker")
-        selected_contact = hs_contacts[labels.index(pick)]
+        hs_contacts = [c for c in st.session_state.contacts if c.get("hs_id")]
 
-    hs = selected_contact["hs_data"]
-    p  = hs["properties"]
+    if hs_contacts:
+        st.divider()
+        st.subheader("📋 HubSpot Context")
+        st.caption("Read-only — not saved with notes. For reference only.")
 
-    with st.container():
-        st.markdown('<div class="hs-panel">', unsafe_allow_html=True)
-        col1, col2 = st.columns(2)
-        with col1:
-            full_name = f"{p.get('firstname','').strip()} {p.get('lastname','').strip()}".strip()
-            st.markdown(f"**{full_name or selected_contact['name']}**")
-            if p.get("email"): st.markdown(f"✉️ {p['email']}")
-            if p.get("phone"): st.markdown(f"📞 {p['phone']}")
-        with col2:
-            if p.get("company"):       st.markdown(f"🏢 {p['company']}")
-            if p.get("jobtitle"):      st.markdown(f"💼 {p['jobtitle']}")
-            if p.get("database_name"): st.markdown(f"🗄 **DB:** {p['database_name']}")
-            if p.get("ikn__c"):        st.markdown(f"🔢 **IKN:** {p['ikn__c']}")
-            if p.get("childplus_license_number"):
-                st.markdown(f"🪪 **License:** {p['childplus_license_number']}")
-            st.markdown(f"[Open in HubSpot ↗]({hs.get('url', '#')})")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        tickets = selected_contact.get("hs_tickets") or []
-        st.markdown(f"**Recent Support Tickets** — last {TICKET_DAYS} days")
-        if not tickets:
-            st.caption("No tickets in this period.")
+        if len(hs_contacts) == 1:
+            selected_contact = hs_contacts[0]
         else:
-            for t in tickets:
-                tp = t["properties"]
-                raw = tp.get("subject","") or ""
-                subj = raw.split(" - ", 1)[1] if " - " in raw else raw
-                try:
-                    date_str = datetime.fromisoformat(tp["createdate"].replace("Z","+00:00")).strftime("%b %d, %Y")
-                except Exception:
-                    date_str = ""
-                pri   = (tp.get("hs_ticket_priority") or "").upper()
-                emoji = {"HIGH":"🔴","MEDIUM":"🟡","LOW":"🟢"}.get(pri, "⚪")
-                body  = tp.get("content","") or ""
-                snip  = (body[:200] + "…") if len(body) > 200 else body
-                with st.expander(f"{emoji} {subj or '(no subject)'} — {date_str}"):
-                    if pri:
-                        st.markdown(f'<span class="ticket-meta">Priority: {pri.title()}</span>', unsafe_allow_html=True)
-                    if snip: st.markdown(snip)
-                    st.markdown(f"[View in HubSpot ↗]({t.get('url','#')})")
+            labels = [c["name"] or "(no name)" for c in hs_contacts]
+            pick = st.selectbox("View context for:", labels, key="hs_view_picker")
+            selected_contact = hs_contacts[labels.index(pick)]
+
+        hs = selected_contact["hs_data"]
+        p  = hs["properties"]
+
+        with st.container():
+            st.markdown('<div class="hs-panel">', unsafe_allow_html=True)
+            col1, col2 = st.columns(2)
+            with col1:
+                full_name = f"{p.get('firstname','').strip()} {p.get('lastname','').strip()}".strip()
+                st.markdown(f"**{full_name or selected_contact['name']}**")
+                if p.get("email"): st.markdown(f"✉️ {p['email']}")
+                if p.get("phone"): st.markdown(f"📞 {p['phone']}")
+            with col2:
+                if p.get("company"):       st.markdown(f"🏢 {p['company']}")
+                if p.get("jobtitle"):      st.markdown(f"💼 {p['jobtitle']}")
+                if p.get("database_name"): st.markdown(f"🗄 **DB:** {p['database_name']}")
+                if p.get("ikn__c"):        st.markdown(f"🔢 **IKN:** {p['ikn__c']}")
+                if p.get("childplus_license_number"):
+                    st.markdown(f"🪪 **License:** {p['childplus_license_number']}")
+                st.markdown(f"[Open in HubSpot ↗]({hs.get('url', '#')})")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            tickets = selected_contact.get("hs_tickets") or []
+            st.markdown(f"**Recent Support Tickets** — last {TICKET_DAYS} days")
+            if not tickets:
+                st.caption("No tickets in this period.")
+            else:
+                for t in tickets:
+                    tp = t["properties"]
+                    raw = tp.get("subject","") or ""
+                    subj = raw.split(" - ", 1)[1] if " - " in raw else raw
+                    try:
+                        date_str = datetime.fromisoformat(tp["createdate"].replace("Z","+00:00")).strftime("%b %d, %Y")
+                    except Exception:
+                        date_str = ""
+                    pri   = (tp.get("hs_ticket_priority") or "").upper()
+                    emoji = {"HIGH":"🔴","MEDIUM":"🟡","LOW":"🟢"}.get(pri, "⚪")
+                    body  = tp.get("content","") or ""
+                    snip  = (body[:200] + "…") if len(body) > 200 else body
+                    with st.expander(f"{emoji} {subj or '(no subject)'} — {date_str}"):
+                        if pri:
+                            st.markdown(f'<span class="ticket-meta">Priority: {pri.title()}</span>', unsafe_allow_html=True)
+                        if snip: st.markdown(snip)
+                        st.markdown(f"[View in HubSpot ↗]({t.get('url','#')})")
