@@ -1,9 +1,9 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import requests
 import uuid
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from streamlit_mic_recorder import speech_to_text
 
 # ─────────────────────────────────────────────
 # CONSTANTS
@@ -429,92 +429,6 @@ def find_similar_tag(new_tag: str, existing_tags: list[str]) -> str | None:
 
 
 # ─────────────────────────────────────────────
-# AUDIO COMPONENT
-# ─────────────────────────────────────────────
-
-def audio_recorder_html(component_id: str = "rec") -> str:
-    return f"""
-<style>
-  body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }}
-  .rec-wrap {{ display:flex;flex-direction:column;align-items:center;gap:10px;padding:12px;
-    background:#f8f9fa;border-radius:10px;border:1px solid #dee2e6; }}
-  .rec-btn {{ width:52px;height:52px;border-radius:50%;border:none;cursor:pointer;
-    font-size:22px;background:#dc3545;color:white;
-    box-shadow:0 3px 10px rgba(220,53,69,0.3);transition:all 0.2s; }}
-  .rec-btn.listening {{ background:#198754;animation:pulse 1s infinite; }}
-  .rec-btn:disabled {{ background:#adb5bd;cursor:default; }}
-  @keyframes pulse {{ 0%,100%{{transform:scale(1)}} 50%{{transform:scale(1.08)}} }}
-  .rec-status {{ font-size:12px;color:#6c757d; }}
-  .rec-box {{ width:100%;box-sizing:border-box;padding:8px;border-radius:6px;
-    border:1px solid #ced4da;font-size:13px;min-height:50px;resize:vertical;display:none; }}
-  .rec-copy {{ padding:5px 14px;background:#0d6efd;color:white;border:none;
-    border-radius:6px;cursor:pointer;font-size:12px;display:none; }}
-  .rec-copy:hover {{ background:#0b5ed7; }}
-  .rec-copied {{ font-size:11px;color:#198754;display:none; }}
-</style>
-<div class="rec-wrap">
-  <button class="rec-btn" id="b_{component_id}">🎙</button>
-  <div class="rec-status" id="s_{component_id}">Tap to record</div>
-  <textarea class="rec-box" id="t_{component_id}" placeholder="Transcription appears here…"></textarea>
-  <div style="display:flex;gap:8px;align-items:center;">
-    <button class="rec-copy" id="c_{component_id}" onclick="copy_{component_id}()">Copy transcript ↓</button>
-    <span class="rec-copied" id="k_{component_id}">Copied!</span>
-  </div>
-</div>
-<script>
-  (function(){{
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const btn=document.getElementById('b_{component_id}');
-    const status=document.getElementById('s_{component_id}');
-    const tbox=document.getElementById('t_{component_id}');
-    const copyBtn=document.getElementById('c_{component_id}');
-    const copied=document.getElementById('k_{component_id}');
-    if (!SR) {{
-      status.textContent='⚠️ Not supported in this browser — use Chrome, Edge, or Safari.';
-      btn.disabled=true; return;
-    }}
-    const rec=new SR();
-    rec.continuous=true; rec.interimResults=true; rec.lang='en-US';
-    let running=false, finalText='';
-    btn.addEventListener('click',()=>{{
-      if(!running){{
-        finalText=''; tbox.value='';
-        rec.start(); running=true;
-        btn.textContent='⏹'; btn.classList.add('listening');
-        status.textContent='Recording… tap to stop';
-      }} else {{ rec.stop(); }}
-    }});
-    rec.onresult=(e)=>{{
-      let interim='';
-      for(let i=e.resultIndex;i<e.results.length;i++){{
-        const t=e.results[i][0].transcript;
-        if(e.results[i].isFinal){{ finalText+=t+' '; }} else {{ interim+=t; }}
-      }}
-      tbox.value=finalText+interim;
-    }};
-    rec.onend=()=>{{
-      running=false; btn.textContent='🎙'; btn.classList.remove('listening');
-      if(finalText.trim()){{
-        status.textContent='✅ Done — copy and paste into note below';
-        tbox.style.display='block'; copyBtn.style.display='inline-block';
-      }} else {{ status.textContent='No speech detected. Tap to try again.'; }}
-    }};
-    rec.onerror=(e)=>{{
-      status.textContent='Error: '+e.error+'. Tap to retry.';
-      running=false; btn.textContent='🎙'; btn.classList.remove('listening');
-    }};
-    window['copy_{component_id}']=function(){{
-      navigator.clipboard.writeText(tbox.value).then(()=>{{
-        copied.style.display='inline';
-        setTimeout(()=>{{ copied.style.display='none'; }},2000);
-      }});
-    }};
-  }})();
-</script>
-"""
-
-
-# ─────────────────────────────────────────────
 # PAGE SETUP
 # ─────────────────────────────────────────────
 
@@ -568,8 +482,8 @@ st.markdown("""
 
 def init_state():
     defaults = {
-        "destination":     None,        # None | "Procare" | "ChildPlus" — chosen first
-        "mode":            None,        # None | "solo" | "group" — chosen second
+        "destination":     None,
+        "mode":            None,
         "session_id":      str(uuid.uuid4()),
         "contacts":        [],
         "solo_search_run": False,
@@ -594,6 +508,9 @@ def init_state():
         "solo_agency":     "",
         "solo_role":       "",
         "solo_database":   "",
+        # Audio recording state
+        "pending_transcript": None,   # transcript awaiting user review/accept
+        "recorder_counter":   0,      # bumped after each accept/discard to reset recorder
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -620,6 +537,46 @@ def build_solo_contact() -> dict:
         "hs_data":  st.session_state.get("solo_hs_data"),
         "hs_tickets": st.session_state.get("solo_hs_tickets"),
     }
+
+
+def add_transcript_to_notes(transcript: str):
+    """Place an accepted transcript in the next available note slot.
+
+    Rule: 'open' = a note whose current text is empty/whitespace.
+    If at least one note is open, fill the first one. Otherwise append a new note.
+    Never overwrites a note that the user has typed in.
+    """
+    text = (transcript or "").strip()
+    if not text:
+        return
+
+    # Look at the live widget value first (what the user has actually typed),
+    # falling back to the dict for newly-added notes that haven't rendered yet.
+    def note_is_open(idx: int) -> bool:
+        widget_key = f"note_text_{idx}"
+        if widget_key in st.session_state:
+            return not st.session_state[widget_key].strip()
+        return not st.session_state.notes[idx]["text"].strip()
+
+    empty_idx = next(
+        (i for i in range(len(st.session_state.notes)) if note_is_open(i)),
+        None,
+    )
+
+    now_ts = datetime.now().isoformat()
+    if empty_idx is not None:
+        # Fill the open slot. Set BOTH the dict and the widget key so the text_area
+        # reflects the new value on the next render (Streamlit widget keys override
+        # the `value=` argument once they exist).
+        st.session_state.notes[empty_idx]["text"] = text
+        st.session_state.notes[empty_idx]["timestamp"] = now_ts
+        st.session_state[f"note_text_{empty_idx}"] = text
+    else:
+        # Append a brand-new note. Pre-seed the widget key so the text_area for
+        # this new index shows the transcript on its first render.
+        new_idx = len(st.session_state.notes)
+        st.session_state.notes.append({"text": text, "timestamp": now_ts})
+        st.session_state[f"note_text_{new_idx}"] = text
 
 
 # ─────────────────────────────────────────────
@@ -706,7 +663,6 @@ if st.session_state.mode is None:
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # Allow going back to step 1 from step 2
     st.write("")
     if st.button("← Back to product line"):
         st.session_state.destination = None
@@ -750,7 +706,6 @@ if st.session_state.mode == "solo":
 
     st.text_input("Title / Role", placeholder="e.g. Executive Director", key="solo_role")
 
-    # HubSpot lookup — only available for ChildPlus
     if hs_available:
         with st.container():
             h1, h2 = st.columns([4, 1])
@@ -829,7 +784,6 @@ else:
         placeholder="e.g. Bright Futures Head Start", key="group_agency_input"
     )
 
-    # HubSpot agency search — only for ChildPlus
     if hs_available:
         h1, h2 = st.columns([4, 1])
         with h1:
@@ -879,7 +833,6 @@ else:
         st.divider()
         st.markdown("**+ Add an attendee**")
 
-    # Manual add (always available)
     m1, m2, m3 = st.columns([2, 2, 1])
     with m1:
         manual_name = st.text_input("Name", key="group_manual_name", label_visibility="collapsed", placeholder="Name")
@@ -900,7 +853,6 @@ else:
                 st.session_state.group_manual_role = ""
                 st.rerun()
 
-    # Show attendees
     if st.session_state.contacts:
         st.divider()
         st.markdown(f"**Attendees ({len(st.session_state.contacts)}):**")
@@ -930,15 +882,57 @@ st.selectbox(
 
 
 # ─────────────────────────────────────────────
-# STEP 5 — NOTES
+# STEP 5 — NOTES (with audio capture)
 # ─────────────────────────────────────────────
 
 st.divider()
 st.subheader("Notes")
-st.caption("🎙 Mic captures your voice from the device's microphone. For in-person capture — not call audio.")
 
-components.html(audio_recorder_html(f"mic_{len(st.session_state.notes)}"), height=200)
+# ── Audio capture: record → review → confirm → goes into next open note ──
+with st.container(border=True):
+    st.markdown("**🎙 Record a quote or thought**")
+    st.caption("Tap to record, tap again to stop. Your voice from the device's mic — not call audio.")
 
+    # Show the recorder unless we're already reviewing a transcript
+    if st.session_state.pending_transcript is None:
+        new_text = speech_to_text(
+            start_prompt="🎙  Start recording",
+            stop_prompt="⏹  Stop recording",
+            language="en",
+            use_container_width=True,
+            just_once=True,
+            key=f"recorder_{st.session_state.recorder_counter}",
+        )
+        if new_text:
+            st.session_state.pending_transcript = new_text
+            st.rerun()
+    else:
+        # Review UI: edit transcript, then accept or discard
+        st.markdown("**Review what you said** — edit if anything is off, then add it to your notes.")
+        edited = st.text_area(
+            "Transcript",
+            value=st.session_state.pending_transcript,
+            key="transcript_review_text",
+            height=140,
+            label_visibility="collapsed",
+        )
+        rcol1, rcol2 = st.columns(2)
+        with rcol1:
+            if st.button("✓  Looks good — add to notes", use_container_width=True, type="primary", key="accept_transcript"):
+                add_transcript_to_notes(edited)
+                st.session_state.pending_transcript = None
+                st.session_state.recorder_counter += 1
+                # Drop the review widget's key so it doesn't carry stale text
+                st.session_state.pop("transcript_review_text", None)
+                st.rerun()
+        with rcol2:
+            if st.button("✕  Discard", use_container_width=True, key="discard_transcript"):
+                st.session_state.pending_transcript = None
+                st.session_state.recorder_counter += 1
+                st.session_state.pop("transcript_review_text", None)
+                st.rerun()
+
+# ── Notes list ──
 for i, note in enumerate(st.session_state.notes):
     with st.container():
         st.markdown(f'<div class="mode-label">Note {i+1}</div>', unsafe_allow_html=True)
@@ -950,12 +944,14 @@ for i, note in enumerate(st.session_state.notes):
                 key=f"note_text_{i}",
                 height=100,
                 label_visibility="collapsed",
-                placeholder="Paste transcription or type a note…",
+                placeholder="Type a note, or use the recorder above.",
             )
         with cols[1]:
             if len(st.session_state.notes) > 1:
                 if st.button("🗑", key=f"rm_note_{i}", help="Remove this note"):
                     st.session_state.notes.pop(i)
+                    # Clean up the widget key for the deleted slot
+                    st.session_state.pop(f"note_text_{i}", None)
                     st.rerun()
 
 if st.button("+ Add another note", use_container_width=True):
