@@ -25,11 +25,24 @@ HS_CONTACT_PROPS = [
     "database_name", "childplus_license_number", "ikn__c",
 ]
 
-# Confluence notes-table columns. Order is the source of truth — every new row
-# emits values in this exact order, and the bootstrap header row uses these
-# strings as <th> labels. If you add/remove/reorder columns, both the header
-# and the row-build logic in save_session_to_confluence() update together.
-NOTES_TABLE_HEADERS = [
+# Two-table layout on each Confluence page:
+#   1. Summary table (top of page, always visible) — at-a-glance scan view
+#   2. Full-detail table (inside an Expand macro, collapsed by default) — all columns for export
+# Both tables get a row appended on every save. SUMMARY_TABLE_HEADERS is a strict
+# subset of FULL_TABLE_HEADERS — any new "full" column is invisible by default
+# until/unless we promote it into the summary list.
+
+SUMMARY_TABLE_HEADERS = [
+    "SubmittedAt",
+    "PrimaryContact",
+    "PrimaryAgency",
+    "NoteText",
+    "Tags",
+    "EventSource",
+    "SessionType",
+]
+
+FULL_TABLE_HEADERS = [
     "SubmittedAt",
     "PrimaryContact",
     "PrimaryAgency",
@@ -44,6 +57,11 @@ NOTES_TABLE_HEADERS = [
     "NoteTimestamp",
     "SessionID",
 ]
+
+# Marker used to detect whether a page already has the two-table layout.
+# Match against the substring inside the macro tag (insensitive to attribute
+# order, since Confluence may reorder ac:name vs ac:schema-version on save).
+EXPAND_MACRO_MARKER = 'ac:name="expand"'
 
 # SharePoint list names — kept here for future migration but not actively used.
 NOTES_LIST_NAME = {"Procare": "PROCARE_NOTES_LIST", "ChildPlus": "CHILDPLUS_NOTES_LIST"}
@@ -178,8 +196,6 @@ def get_contact_tickets(contact_id: str, token: str) -> list:
 # ─────────────────────────────────────────────
 
 def get_confluence_config() -> dict | None:
-    """Pull Confluence credentials and target page IDs from Streamlit secrets.
-    Returns None if any required secret is missing — caller falls back to CSV."""
     try:
         return {
             "email":  st.secrets["ATLASSIAN_EMAIL"],
@@ -195,8 +211,6 @@ def get_confluence_config() -> dict | None:
 
 
 def fetch_confluence_page(cfg: dict, page_id: str) -> tuple[dict | None, str]:
-    """GET page with current storage body and version number.
-    Returns (page_data, error_message). page_data is None on failure."""
     url = f"https://{cfg['domain']}/wiki/rest/api/content/{page_id}"
     try:
         resp = requests.get(
@@ -214,7 +228,6 @@ def fetch_confluence_page(cfg: dict, page_id: str) -> tuple[dict | None, str]:
 
 
 def update_confluence_page(cfg: dict, page_id: str, title: str, new_storage: str, new_version: int) -> tuple[bool, str]:
-    """PUT the updated page body. Confluence requires the next version number."""
     url = f"https://{cfg['domain']}/wiki/rest/api/content/{page_id}"
     try:
         resp = requests.put(
@@ -249,35 +262,81 @@ def _cell_content(text: str) -> str:
     return html.escape(str(text), quote=False).replace("\n", "<br/>")
 
 
-def _build_header_row() -> str:
-    return "<tr>" + "".join(f"<th>{html.escape(h)}</th>" for h in NOTES_TABLE_HEADERS) + "</tr>"
+def _build_header_row(headers: list[str]) -> str:
+    return "<tr>" + "".join(f"<th>{html.escape(h)}</th>" for h in headers) + "</tr>"
 
 
 def _build_data_row(values: list[str]) -> str:
     return "<tr>" + "".join(f"<td>{_cell_content(v)}</td>" for v in values) + "</tr>"
 
 
-def _append_rows_to_storage(storage: str, new_rows_html: str) -> str:
-    """Insert new <tr> elements at the end of the page's existing table.
-    If the page has no table yet (first save), bootstrap one with headers + rows.
-    Assumes there is at most one notes table per page — true for our case since
-    these pages are dedicated to this app."""
-    if "</tbody>" in storage:
-        idx = storage.rfind("</tbody>")
-        return storage[:idx] + new_rows_html + storage[idx:]
-    else:
-        return storage + (
-            "<table>"
-            "<tbody>"
-            f"{_build_header_row()}"
-            f"{new_rows_html}"
-            "</tbody>"
-            "</table>"
-        )
+def _bootstrap_two_tables(summary_rows_html: str, full_rows_html: str) -> str:
+    """Build the initial page structure: summary table on top, full-detail table
+    inside an Expand macro that's collapsed by default."""
+    summary_table = (
+        "<h3>Summary</h3>"
+        "<table><tbody>"
+        f"{_build_header_row(SUMMARY_TABLE_HEADERS)}"
+        f"{summary_rows_html}"
+        "</tbody></table>"
+    )
+    full_table = (
+        '<ac:structured-macro ac:name="expand" ac:schema-version="1">'
+        '<ac:parameter ac:name="title">Show full data (all columns)</ac:parameter>'
+        '<ac:rich-text-body>'
+        '<table><tbody>'
+        f'{_build_header_row(FULL_TABLE_HEADERS)}'
+        f'{full_rows_html}'
+        '</tbody></table>'
+        '</ac:rich-text-body>'
+        '</ac:structured-macro>'
+    )
+    return summary_table + full_table
+
+
+def _append_rows_to_storage(storage: str, summary_rows_html: str, full_rows_html: str) -> str | None:
+    """Insert new rows into both the summary and full tables in one storage update.
+
+    Layout invariant after bootstrap:
+      <h3>Summary</h3><table>...summary tbody...</table>
+      <ac:structured-macro name=expand>
+        <ac:rich-text-body><table>...full tbody...</table></ac:rich-text-body>
+      </ac:structured-macro>
+
+    Returns the new storage string, or None if the page structure is malformed
+    (which causes the caller to fall back to CSV).
+    """
+    if EXPAND_MACRO_MARKER not in storage:
+        # Page hasn't been initialized with the two-table layout yet — bootstrap.
+        # Existing page content (description text, etc.) above is preserved.
+        return storage + _bootstrap_two_tables(summary_rows_html, full_rows_html)
+
+    expand_idx = storage.find(EXPAND_MACRO_MARKER)
+
+    # Summary tbody close = the last </tbody> on the page BEFORE the expand macro
+    summary_close = storage.rfind("</tbody>", 0, expand_idx)
+    if summary_close == -1:
+        return None
+
+    # Full tbody close = the last </tbody> on the page (inside the expand macro)
+    full_close = storage.rfind("</tbody>")
+    if full_close <= summary_close:
+        return None
+
+    # Splice both new row blocks in at once. Indices stay valid because we
+    # rebuild the string from segments rather than mutating in place.
+    return (
+        storage[:summary_close]
+        + summary_rows_html
+        + storage[summary_close:full_close]
+        + full_rows_html
+        + storage[full_close:]
+    )
 
 
 def save_session_to_confluence(session_data: dict) -> tuple[bool, str]:
-    """Append a row per note to the destination's Confluence page table."""
+    """Append a row per note to BOTH the summary table and the full-detail table
+    on the destination's Confluence page."""
     cfg = get_confluence_config()
     if not cfg:
         return False, "confluence_not_configured"
@@ -299,9 +358,23 @@ def save_session_to_confluence(session_data: dict) -> tuple[bool, str]:
     contacts_blob = format_contacts_blob(session_data["contacts"])
     primary       = session_data["contacts"][0] if session_data["contacts"] else {"name": "", "agency": "", "database": ""}
 
-    rows_html = ""
+    summary_rows_html = ""
+    full_rows_html    = ""
     for idx, note in enumerate(notes, start=1):
-        row_values = [
+        # Summary row — the at-a-glance set
+        summary_values = [
+            session_data["submitted_at"],         # SubmittedAt
+            primary.get("name", ""),              # PrimaryContact
+            primary.get("agency", ""),            # PrimaryAgency
+            note["text"],                         # NoteText
+            ", ".join(session_data["tags"]),      # Tags
+            session_data["event_source"],         # EventSource
+            session_data["session_type"],         # SessionType
+        ]
+        summary_rows_html += _build_data_row(summary_values)
+
+        # Full-detail row — every column for export/audit
+        full_values = [
             session_data["submitted_at"],
             primary.get("name", ""),
             primary.get("agency", ""),
@@ -316,9 +389,12 @@ def save_session_to_confluence(session_data: dict) -> tuple[bool, str]:
             note["timestamp"],
             session_data["session_id"],
         ]
-        rows_html += _build_data_row(row_values)
+        full_rows_html += _build_data_row(full_values)
 
-    new_storage = _append_rows_to_storage(current_storage, rows_html)
+    new_storage = _append_rows_to_storage(current_storage, summary_rows_html, full_rows_html)
+    if new_storage is None:
+        return False, "Page layout looks malformed — cannot append rows. Manual cleanup of the page is needed."
+
     new_version = current_version + 1
 
     success, message = update_confluence_page(cfg, page_id, title, new_storage, new_version)
@@ -330,10 +406,6 @@ def save_session_to_confluence(session_data: dict) -> tuple[bool, str]:
 # ─────────────────────────────────────────────
 # SHAREPOINT HELPERS  (DEFERRED — kept for future migration)
 # ─────────────────────────────────────────────
-# Confluence is the active backend during the SharePoint approval period.
-# Once Azure AD app registration is approved by IT, switch the call site in
-# the Save handler from save_session_to_confluence() to save_session_notes_sharepoint()
-# and re-introduce the get_sharepoint_config() check at app startup.
 
 def get_sharepoint_config() -> dict | None:
     try:
@@ -364,11 +436,6 @@ def get_graph_token(cfg: dict) -> str | None:
         }, timeout=10,
     )
     return resp.json().get("access_token") if resp.ok else None
-
-
-# (SharePoint list-creation, tag fetch/save, and notes-save helpers retained
-# in the previous file revision — removed here for brevity since none are
-# called in the active code path. Restore from git history when needed.)
 
 
 # ─────────────────────────────────────────────
@@ -451,8 +518,6 @@ st.markdown("""
 
 # ─────────────────────────────────────────────
 # PASSWORD GATE
-# Runs before any other UI. Once authenticated for the session, never re-prompts
-# until the browser tab is closed. Fails closed if APP_PASSWORD secret is missing.
 # ─────────────────────────────────────────────
 
 def show_password_gate():
@@ -504,15 +569,12 @@ def init_state():
         "tags":            [],
         "submitted":       False,
         "last_entry":      None,
-        # Solo-mode contact fields — single source of truth
         "solo_name":       "",
         "solo_agency":     "",
         "solo_role":       "",
         "solo_database":   "",
-        # Audio recording state
         "pending_transcript": None,
         "recorder_counter":   0,
-        # Tag input (simplified stopgap — see TODO in the Tags section)
         "new_tag_input":   "",
     }
     for k, v in defaults.items():
@@ -523,8 +585,6 @@ init_state()
 
 
 def reset_all():
-    """Reset everything except the password lock — Sebrina shouldn't have to re-enter
-    the password just because she finished one capture and is starting another."""
     keep_authenticated = st.session_state.get("password_correct", False)
     keys = list(st.session_state.keys())
     for k in keys:
@@ -575,9 +635,6 @@ def add_transcript_to_notes(transcript: str):
 
 # ─────────────────────────────────────────────
 # CALLBACKS
-# Streamlit forbids writing to a widget key after the widget has rendered in the
-# same script run. Callbacks (on_click) execute BEFORE the next script run starts,
-# so writes to widget keys (solo_name, solo_agency, etc.) happen safely there.
 # ─────────────────────────────────────────────
 
 def _apply_hubspot_pick(contact: dict, token: str):
@@ -633,7 +690,6 @@ def _add_hubspot_attendee(contact: dict, token: str):
 
 
 def _add_tag():
-    """Tag-add callback — runs before next render so we can clear the widget key."""
     candidate = st.session_state.get("new_tag_input", "").strip()
     if candidate and candidate not in st.session_state.tags:
         st.session_state.tags.append(candidate)
@@ -646,7 +702,6 @@ def _add_tag():
 
 st.title("🎤 Customer Notes")
 
-# Success banner
 if st.session_state.submitted:
     entry        = st.session_state.last_entry or {}
     note_count   = len(entry.get("notes", []))
@@ -655,8 +710,6 @@ if st.session_state.submitted:
     used_csv     = entry.get("fallback_csv", False)
 
     if used_csv:
-        # Confluence didn't take it — show a softer banner so it's clear the
-        # data isn't lost (download is offered below) but write didn't land.
         st.markdown(
             f'<div class="fallback-banner">⚠️ Saved locally — Confluence write failed. '
             f'{note_count} note(s) for {contact_count} contact(s) are below as CSV.</div>',
@@ -751,7 +804,7 @@ if st.session_state.mode is None:
 
 
 # ─────────────────────────────────────────────
-# RIBBON — both selections + change button
+# RIBBON
 # ─────────────────────────────────────────────
 
 mode_label   = "Solo conversation" if st.session_state.mode == "solo" else "Group conversation"
@@ -1013,23 +1066,17 @@ if st.button("+ Add another note", use_container_width=True):
 
 
 # ─────────────────────────────────────────────
-# STEP 6 — TAGS
-# Stopgap version: simple text input + Add. No autocomplete, no similarity check.
+# STEP 6 — TAGS  (simplified stopgap — see TODO)
 # TODO (post-stopgap):
-#   - Restore "Pick existing tag" dropdown sourced from the destination's tag store
+#   - Restore "Pick existing tag" dropdown
 #   - Restore find_similar_tag() check with "did you mean X?" prompt
-#   - Source of existing tags can be either:
-#       (a) SharePoint Tags list (when AD approval comes through), or
-#       (b) parsed from the Tags column of the Confluence notes table
-#   - The `find_similar_tag()` function and TAG_SIMILARITY constant are still
-#     in the file, ready to wire back up.
+#   - Source: SharePoint Tags list (when AD approved) or parse Tags column from Confluence
 # ─────────────────────────────────────────────
 
 st.divider()
 st.subheader("Tags")
 st.caption(f"Topics for this session — saved with the {st.session_state.destination} note.")
 
-# Selected tag pills (X to remove)
 if st.session_state.tags:
     cols = st.columns(min(len(st.session_state.tags) + 1, 6))
     for i, t in enumerate(st.session_state.tags):
@@ -1038,7 +1085,6 @@ if st.session_state.tags:
                 st.session_state.tags.remove(t)
                 st.rerun()
 
-# Add a new tag (free-text only during stopgap)
 tcol1, tcol2 = st.columns([4, 1])
 with tcol1:
     st.text_input(
@@ -1058,8 +1104,6 @@ with tcol2:
 
 # ─────────────────────────────────────────────
 # STEP 7 — SAVE
-# Tries Confluence first; on any failure, falls back to CSV download so the
-# user never loses what they captured.
 # ─────────────────────────────────────────────
 
 st.divider()
@@ -1100,12 +1144,10 @@ if save_clicked:
             success, message = save_session_to_confluence(session_data)
 
         if success:
-            # Clean Confluence write
             st.session_state.last_entry = session_data
             st.session_state.submitted  = True
             st.rerun()
         else:
-            # Anything went wrong — guarantee data isn't lost by handing back a CSV
             session_data["fallback_csv"] = True
             session_data["save_error"]   = message
             st.session_state.last_entry  = session_data
@@ -1114,7 +1156,7 @@ if save_clicked:
 
 
 # ─────────────────────────────────────────────
-# HUBSPOT CONTEXT (BOTTOM) — only when destination = ChildPlus
+# HUBSPOT CONTEXT (BOTTOM)
 # ─────────────────────────────────────────────
 
 if hs_available:
