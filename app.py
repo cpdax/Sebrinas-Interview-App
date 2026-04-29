@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import uuid
+import html
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from streamlit_mic_recorder import speech_to_text
@@ -14,19 +15,37 @@ SOURCE_OPTIONS      = ["Conference", "Site Visit", "Zoom", "Other"]
 HS_BASE             = "https://api.hubapi.com"
 TICKET_DAYS         = 90
 TICKET_MAX          = 5
-TAG_SIMILARITY      = 0.75  # 75% similarity threshold for "did you mean?"
+TAG_SIMILARITY      = 0.75  # Retained for future use; tag autocomplete is OFF in stopgap.
 
 # HubSpot is only used for ChildPlus. Procare contacts are captured manually.
 HS_DESTINATION = "ChildPlus"
 
-# HubSpot contact properties pulled on every search.
-# Includes ChildPlus-specific identifiers (database_name, license, IKN) so that
-# duplicate / similar contacts can be visually disambiguated by the user.
 HS_CONTACT_PROPS = [
     "firstname", "lastname", "email", "company", "phone", "jobtitle",
     "database_name", "childplus_license_number", "ikn__c",
 ]
 
+# Confluence notes-table columns. Order is the source of truth — every new row
+# emits values in this exact order, and the bootstrap header row uses these
+# strings as <th> labels. If you add/remove/reorder columns, both the header
+# and the row-build logic in save_session_to_confluence() update together.
+NOTES_TABLE_HEADERS = [
+    "SubmittedAt",
+    "PrimaryContact",
+    "PrimaryAgency",
+    "PrimaryDatabase",
+    "EventSource",
+    "Tags",
+    "NoteText",
+    "SessionType",
+    "NoteIndex",
+    "NoteCount",
+    "Contacts",
+    "NoteTimestamp",
+    "SessionID",
+]
+
+# SharePoint list names — kept here for future migration but not actively used.
 NOTES_LIST_NAME = {"Procare": "PROCARE_NOTES_LIST", "ChildPlus": "CHILDPLUS_NOTES_LIST"}
 TAGS_LIST_NAME  = {"Procare": "PROCARE_TAGS_LIST",  "ChildPlus": "CHILDPLUS_TAGS_LIST"}
 
@@ -43,8 +62,6 @@ def get_hubspot_token() -> str | None:
 
 
 def _contact_sort_key(contact: dict) -> tuple:
-    """Sort contacts alphabetically by last name then first name (case-insensitive).
-    Empty / missing names sort to the bottom so meaningful records stay at top."""
     p = contact.get("properties", {})
     last  = (p.get("lastname")  or "").strip().lower()
     first = (p.get("firstname") or "").strip().lower()
@@ -72,7 +89,6 @@ def _search_contacts(filters: list, token: str) -> list:
 
 
 def search_hubspot_contacts(name: str, agency: str, token: str) -> list:
-    """Search by name, agency, or both. All provided terms are ANDed."""
     filters = []
     name, agency = name.strip(), agency.strip()
     if name:
@@ -86,7 +102,6 @@ def search_hubspot_contacts(name: str, agency: str, token: str) -> list:
 
 
 def search_contacts_by_agency(agency: str, token: str) -> list:
-    """Group mode — return all contacts at an agency."""
     if not agency.strip():
         return []
     return _search_contacts(
@@ -96,9 +111,6 @@ def search_contacts_by_agency(agency: str, token: str) -> list:
 
 
 def render_contact_card(props: dict) -> str:
-    """Build the markdown card body shown in solo search results & group attendee list.
-    Always renders Agency, Database, Email, Role rows, marking missing fields explicitly
-    so users can disambiguate similar/duplicate contacts."""
     full_name = f"{props.get('firstname','').strip()} {props.get('lastname','').strip()}".strip() or "(no name)"
 
     def field(value, missing_label="—"):
@@ -162,8 +174,166 @@ def get_contact_tickets(contact_id: str, token: str) -> list:
 
 
 # ─────────────────────────────────────────────
-# SHAREPOINT / GRAPH HELPERS
+# CONFLUENCE HELPERS  (active backend)
 # ─────────────────────────────────────────────
+
+def get_confluence_config() -> dict | None:
+    """Pull Confluence credentials and target page IDs from Streamlit secrets.
+    Returns None if any required secret is missing — caller falls back to CSV."""
+    try:
+        return {
+            "email":  st.secrets["ATLASSIAN_EMAIL"],
+            "token":  st.secrets["ATLASSIAN_API_TOKEN"],
+            "domain": st.secrets["ATLASSIAN_DOMAIN"],
+            "page_ids": {
+                "ChildPlus": st.secrets["CHILDPLUS_NOTES_PAGE_ID"],
+                "Procare":   st.secrets["PROCARE_NOTES_PAGE_ID"],
+            },
+        }
+    except (KeyError, FileNotFoundError):
+        return None
+
+
+def fetch_confluence_page(cfg: dict, page_id: str) -> tuple[dict | None, str]:
+    """GET page with current storage body and version number.
+    Returns (page_data, error_message). page_data is None on failure."""
+    url = f"https://{cfg['domain']}/wiki/rest/api/content/{page_id}"
+    try:
+        resp = requests.get(
+            url,
+            params={"expand": "body.storage,version"},
+            auth=(cfg["email"], cfg["token"]),
+            headers={"Accept": "application/json"},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        return None, f"Network error fetching page: {e}"
+    if not resp.ok:
+        return None, f"GET failed {resp.status_code}: {resp.text[:200]}"
+    return resp.json(), ""
+
+
+def update_confluence_page(cfg: dict, page_id: str, title: str, new_storage: str, new_version: int) -> tuple[bool, str]:
+    """PUT the updated page body. Confluence requires the next version number."""
+    url = f"https://{cfg['domain']}/wiki/rest/api/content/{page_id}"
+    try:
+        resp = requests.put(
+            url,
+            auth=(cfg["email"], cfg["token"]),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            json={
+                "version": {"number": new_version},
+                "title":   title,
+                "type":    "page",
+                "body": {
+                    "storage": {
+                        "value":          new_storage,
+                        "representation": "storage",
+                    }
+                },
+            },
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        return False, f"Network error: {e}"
+    if not resp.ok:
+        return False, f"PUT failed {resp.status_code}: {resp.text[:300]}"
+    return True, "ok"
+
+
+def _cell_content(text: str) -> str:
+    """Escape a value for safe inclusion in a Confluence storage <td>.
+    Newlines become <br/> so multi-line note text renders as expected."""
+    if not text:
+        return ""
+    return html.escape(str(text), quote=False).replace("\n", "<br/>")
+
+
+def _build_header_row() -> str:
+    return "<tr>" + "".join(f"<th>{html.escape(h)}</th>" for h in NOTES_TABLE_HEADERS) + "</tr>"
+
+
+def _build_data_row(values: list[str]) -> str:
+    return "<tr>" + "".join(f"<td>{_cell_content(v)}</td>" for v in values) + "</tr>"
+
+
+def _append_rows_to_storage(storage: str, new_rows_html: str) -> str:
+    """Insert new <tr> elements at the end of the page's existing table.
+    If the page has no table yet (first save), bootstrap one with headers + rows.
+    Assumes there is at most one notes table per page — true for our case since
+    these pages are dedicated to this app."""
+    if "</tbody>" in storage:
+        idx = storage.rfind("</tbody>")
+        return storage[:idx] + new_rows_html + storage[idx:]
+    else:
+        return storage + (
+            "<table>"
+            "<tbody>"
+            f"{_build_header_row()}"
+            f"{new_rows_html}"
+            "</tbody>"
+            "</table>"
+        )
+
+
+def save_session_to_confluence(session_data: dict) -> tuple[bool, str]:
+    """Append a row per note to the destination's Confluence page table."""
+    cfg = get_confluence_config()
+    if not cfg:
+        return False, "confluence_not_configured"
+
+    dest = session_data["destination"]
+    page_id = cfg["page_ids"].get(dest)
+    if not page_id:
+        return False, f"No Confluence page configured for {dest}"
+
+    page, err = fetch_confluence_page(cfg, page_id)
+    if not page:
+        return False, err or "Could not fetch Confluence page"
+
+    current_storage = page.get("body", {}).get("storage", {}).get("value", "")
+    current_version = page.get("version", {}).get("number", 1)
+    title           = page.get("title", "")
+
+    notes         = session_data["notes"]
+    contacts_blob = format_contacts_blob(session_data["contacts"])
+    primary       = session_data["contacts"][0] if session_data["contacts"] else {"name": "", "agency": "", "database": ""}
+
+    rows_html = ""
+    for idx, note in enumerate(notes, start=1):
+        row_values = [
+            session_data["submitted_at"],
+            primary.get("name", ""),
+            primary.get("agency", ""),
+            primary.get("database", ""),
+            session_data["event_source"],
+            ", ".join(session_data["tags"]),
+            note["text"],
+            session_data["session_type"],
+            str(idx),
+            str(len(notes)),
+            contacts_blob,
+            note["timestamp"],
+            session_data["session_id"],
+        ]
+        rows_html += _build_data_row(row_values)
+
+    new_storage = _append_rows_to_storage(current_storage, rows_html)
+    new_version = current_version + 1
+
+    success, message = update_confluence_page(cfg, page_id, title, new_storage, new_version)
+    if success:
+        return True, f"Saved {len(notes)} note(s) to Confluence"
+    return False, message
+
+
+# ─────────────────────────────────────────────
+# SHAREPOINT HELPERS  (DEFERRED — kept for future migration)
+# ─────────────────────────────────────────────
+# Confluence is the active backend during the SharePoint approval period.
+# Once Azure AD app registration is approved by IT, switch the call site in
+# the Save handler from save_session_to_confluence() to save_session_notes_sharepoint()
+# and re-introduce the get_sharepoint_config() check at app startup.
 
 def get_sharepoint_config() -> dict | None:
     try:
@@ -174,10 +344,10 @@ def get_sharepoint_config() -> dict | None:
             "hostname":            st.secrets["SHAREPOINT_HOSTNAME"],
             "procare_site_path":   st.secrets["PROCARE_SITE_PATH"],
             "childplus_site_path": st.secrets["CHILDPLUS_SITE_PATH"],
-            "procare_notes_list":   st.secrets["PROCARE_NOTES_LIST"],
-            "childplus_notes_list": st.secrets["CHILDPLUS_NOTES_LIST"],
-            "procare_tags_list":    st.secrets["PROCARE_TAGS_LIST"],
-            "childplus_tags_list":  st.secrets["CHILDPLUS_TAGS_LIST"],
+            "procare_notes_list":  st.secrets["PROCARE_NOTES_LIST"],
+            "childplus_notes_list":st.secrets["CHILDPLUS_NOTES_LIST"],
+            "procare_tags_list":   st.secrets["PROCARE_TAGS_LIST"],
+            "childplus_tags_list": st.secrets["CHILDPLUS_TAGS_LIST"],
         }
     except (KeyError, FileNotFoundError):
         return None
@@ -196,201 +366,14 @@ def get_graph_token(cfg: dict) -> str | None:
     return resp.json().get("access_token") if resp.ok else None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_site_id(hostname: str, site_path: str, token: str) -> str | None:
-    resp = requests.get(
-        f"https://graph.microsoft.com/v1.0/sites/{hostname}:{site_path}",
-        headers={"Authorization": f"Bearer {token}"}, timeout=10,
-    )
-    return resp.json().get("id") if resp.ok else None
+# (SharePoint list-creation, tag fetch/save, and notes-save helpers retained
+# in the previous file revision — removed here for brevity since none are
+# called in the active code path. Restore from git history when needed.)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def ensure_notes_list(site_id: str, list_name: str, token: str) -> str | None:
-    """Get or create the one-row-per-note list."""
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    existing = requests.get(
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists",
-        headers=headers, timeout=10,
-    )
-    if existing.ok:
-        for lst in existing.json().get("value", []):
-            if lst.get("displayName") == list_name:
-                return lst["id"]
-
-    create = requests.post(
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists",
-        headers=headers,
-        json={
-            "displayName": list_name,
-            "columns": [
-                {"name": "SessionID",       "text": {}},
-                {"name": "NoteIndex",       "number": {}},
-                {"name": "NoteCount",       "number": {}},
-                {"name": "SessionType",     "choice": {"choices": ["Solo", "Group"]}},
-                {"name": "Contacts",        "text": {"allowMultipleLines": True}},
-                {"name": "PrimaryContact",  "text": {}},
-                {"name": "PrimaryAgency",   "text": {}},
-                {"name": "PrimaryDatabase", "text": {}},
-                {"name": "Destination",     "choice": {"choices": DESTINATION_OPTIONS}},
-                {"name": "EventSource",     "choice": {"choices": SOURCE_OPTIONS}},
-                {"name": "Tags",            "text": {}},
-                {"name": "NoteText",        "text": {"allowMultipleLines": True}},
-                {"name": "NoteTimestamp",   "dateTime": {}},
-                {"name": "SubmittedAt",     "dateTime": {}},
-            ],
-            "list": {"template": "genericList"},
-        }, timeout=15,
-    )
-    return create.json().get("id") if create.ok else None
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def ensure_tags_list(site_id: str, list_name: str, token: str) -> str | None:
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    existing = requests.get(
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists",
-        headers=headers, timeout=10,
-    )
-    if existing.ok:
-        for lst in existing.json().get("value", []):
-            if lst.get("displayName") == list_name:
-                return lst["id"]
-
-    create = requests.post(
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists",
-        headers=headers,
-        json={
-            "displayName": list_name,
-            "columns": [
-                {"name": "TagName",   "text": {}},
-                {"name": "FirstUsed", "dateTime": {}},
-                {"name": "UseCount",  "number": {}},
-            ],
-            "list": {"template": "genericList"},
-        }, timeout=15,
-    )
-    return create.json().get("id") if create.ok else None
-
-
-def fetch_tags(destination: str) -> list[str]:
-    """Return list of tag names from the destination's Tags list. [] if SharePoint not configured."""
-    cfg = get_sharepoint_config()
-    if not cfg:
-        return st.session_state.get("local_tags", [])
-
-    token = get_graph_token(cfg)
-    if not token:
-        return []
-
-    site_path = cfg["procare_site_path"] if destination == "Procare" else cfg["childplus_site_path"]
-    list_name = cfg["procare_tags_list"] if destination == "Procare" else cfg["childplus_tags_list"]
-    site_id = get_site_id(cfg["hostname"], site_path, token)
-    if not site_id:
-        return []
-    list_id = ensure_tags_list(site_id, list_name, token)
-    if not list_id:
-        return []
-
-    resp = requests.get(
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items?expand=fields",
-        headers={"Authorization": f"Bearer {token}"}, timeout=10,
-    )
-    if not resp.ok:
-        return []
-    return sorted({
-        item["fields"].get("TagName", "").strip()
-        for item in resp.json().get("value", [])
-        if item["fields"].get("TagName")
-    })
-
-
-def save_new_tag(tag_name: str, destination: str):
-    """Append a new tag to the destination's Tags list."""
-    cfg = get_sharepoint_config()
-    if not cfg:
-        st.session_state.setdefault("local_tags", [])
-        if tag_name not in st.session_state.local_tags:
-            st.session_state.local_tags.append(tag_name)
-        return
-
-    token = get_graph_token(cfg)
-    if not token:
-        return
-
-    site_path = cfg["procare_site_path"] if destination == "Procare" else cfg["childplus_site_path"]
-    list_name = cfg["procare_tags_list"] if destination == "Procare" else cfg["childplus_tags_list"]
-    site_id = get_site_id(cfg["hostname"], site_path, token)
-    if not site_id:
-        return
-    list_id = ensure_tags_list(site_id, list_name, token)
-    if not list_id:
-        return
-
-    requests.post(
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={"fields": {
-            "Title":     tag_name,
-            "TagName":   tag_name,
-            "FirstUsed": datetime.now(timezone.utc).isoformat(),
-            "UseCount":  1,
-        }}, timeout=10,
-    )
-
-
-def save_session_notes(session_data: dict) -> tuple[bool, str]:
-    """Save all notes from a session as individual SharePoint rows."""
-    cfg = get_sharepoint_config()
-    if not cfg:
-        return False, "sharepoint_not_configured"
-
-    token = get_graph_token(cfg)
-    if not token:
-        return False, "Could not acquire Graph token"
-
-    dest = session_data["destination"]
-    site_path = cfg["procare_site_path"] if dest == "Procare" else cfg["childplus_site_path"]
-    list_name = cfg["procare_notes_list"] if dest == "Procare" else cfg["childplus_notes_list"]
-    site_id = get_site_id(cfg["hostname"], site_path, token)
-    if not site_id:
-        return False, "Could not resolve SharePoint site"
-    list_id = ensure_notes_list(site_id, list_name, token)
-    if not list_id:
-        return False, "Could not get or create notes list"
-
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    notes   = session_data["notes"]
-    contacts_blob = format_contacts_blob(session_data["contacts"])
-    primary       = session_data["contacts"][0] if session_data["contacts"] else {"name": "", "agency": "", "database": ""}
-
-    for idx, note in enumerate(notes, start=1):
-        payload = {"fields": {
-            "Title":           f"{primary['name']} — note {idx}/{len(notes)}",
-            "SessionID":       session_data["session_id"],
-            "NoteIndex":       idx,
-            "NoteCount":       len(notes),
-            "SessionType":     session_data["session_type"],
-            "Contacts":        contacts_blob,
-            "PrimaryContact":  primary["name"],
-            "PrimaryAgency":   primary["agency"],
-            "PrimaryDatabase": primary.get("database", ""),
-            "Destination":     dest,
-            "EventSource":     session_data["event_source"],
-            "Tags":            ", ".join(session_data["tags"]),
-            "NoteText":        note["text"],
-            "NoteTimestamp":   note["timestamp"],
-            "SubmittedAt":     session_data["submitted_at"],
-        }}
-        resp = requests.post(
-            f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items",
-            headers=headers, json=payload, timeout=15,
-        )
-        if not resp.ok:
-            return False, f"Failed on note {idx}: {resp.status_code} {resp.text[:200]}"
-
-    return True, f"Saved {len(notes)} notes"
-
+# ─────────────────────────────────────────────
+# CONTACT BLOB FORMATTER (used by Confluence rows + CSV fallback)
+# ─────────────────────────────────────────────
 
 def format_contacts_blob(contacts: list[dict]) -> str:
     parts = []
@@ -411,7 +394,7 @@ def format_contacts_blob(contacts: list[dict]) -> str:
 
 
 # ─────────────────────────────────────────────
-# TAG SIMILARITY
+# TAG SIMILARITY  (kept for future restore — not used in stopgap)
 # ─────────────────────────────────────────────
 
 def find_similar_tag(new_tag: str, existing_tags: list[str]) -> str | None:
@@ -455,25 +438,45 @@ st.markdown("""
     display:inline-block; background:#e7f1ff; color:#0a58ca;
     padding:4px 10px; border-radius:12px; font-size:13px; margin:2px 4px 2px 0;
   }
-  .note-box {
-    background:#f8f9fa; border:1px solid #dee2e6;
-    border-radius:10px; padding:14px; margin-bottom:10px;
-  }
-  .contact-box {
-    background:#ffffff; border:1px solid #dee2e6;
-    border-radius:10px; padding:14px; margin-bottom:10px;
-  }
-  .hs-panel { background:#f0f4ff; border:1px solid #c7d7ff;
-    border-radius:10px; padding:14px; margin-top:8px; }
+  .note-box { background:#f8f9fa; border:1px solid #dee2e6; border-radius:10px; padding:14px; margin-bottom:10px; }
+  .contact-box { background:#ffffff; border:1px solid #dee2e6; border-radius:10px; padding:14px; margin-bottom:10px; }
+  .hs-panel { background:#f0f4ff; border:1px solid #c7d7ff; border-radius:10px; padding:14px; margin-top:8px; }
   .ticket-meta { font-size:12px; color:#6c757d; }
-  .success-banner { background:#d1e7dd; color:#0f5132;
-    padding:16px; border-radius:10px; text-align:center; font-weight:600; }
-  .fallback-banner { background:#fff3cd; color:#664d03;
-    padding:12px; border-radius:8px; font-size:13px; }
-  .mode-label { font-size:12px; color:#6c757d; text-transform:uppercase;
-    letter-spacing:0.05em; font-weight:600; }
+  .success-banner { background:#d1e7dd; color:#0f5132; padding:16px; border-radius:10px; text-align:center; font-weight:600; }
+  .fallback-banner { background:#fff3cd; color:#664d03; padding:12px; border-radius:8px; font-size:13px; }
+  .mode-label { font-size:12px; color:#6c757d; text-transform:uppercase; letter-spacing:0.05em; font-weight:600; }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+# PASSWORD GATE
+# Runs before any other UI. Once authenticated for the session, never re-prompts
+# until the browser tab is closed. Fails closed if APP_PASSWORD secret is missing.
+# ─────────────────────────────────────────────
+
+def show_password_gate():
+    if st.session_state.get("password_correct"):
+        return
+    try:
+        expected = st.secrets["APP_PASSWORD"]
+    except (KeyError, FileNotFoundError):
+        st.error("⚠️ APP_PASSWORD is not configured in Streamlit secrets. Contact the admin.")
+        st.stop()
+
+    st.title("🎤 Customer Notes")
+    st.caption("This app is password-protected. Please enter the access password to continue.")
+    pw = st.text_input("Password", type="password", label_visibility="collapsed", key="pw_input")
+
+    if pw:
+        if pw == expected:
+            st.session_state.password_correct = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
+
+show_password_gate()
 
 
 # ─────────────────────────────────────────────
@@ -499,8 +502,6 @@ def init_state():
         "event_source":    SOURCE_OPTIONS[0],
         "notes":           [{"text": "", "timestamp": datetime.now().isoformat()}],
         "tags":            [],
-        "pending_tag_input": "",
-        "pending_similar_tag": None,
         "submitted":       False,
         "last_entry":      None,
         # Solo-mode contact fields — single source of truth
@@ -511,6 +512,8 @@ def init_state():
         # Audio recording state
         "pending_transcript": None,
         "recorder_counter":   0,
+        # Tag input (simplified stopgap — see TODO in the Tags section)
+        "new_tag_input":   "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -520,14 +523,18 @@ init_state()
 
 
 def reset_all():
+    """Reset everything except the password lock — Sebrina shouldn't have to re-enter
+    the password just because she finished one capture and is starting another."""
+    keep_authenticated = st.session_state.get("password_correct", False)
     keys = list(st.session_state.keys())
     for k in keys:
         del st.session_state[k]
     init_state()
+    if keep_authenticated:
+        st.session_state.password_correct = True
 
 
 def build_solo_contact() -> dict:
-    """Read the solo contact's current state from session_state widget keys."""
     return {
         "name":     st.session_state.get("solo_name", "").strip(),
         "agency":   st.session_state.get("solo_agency", "").strip(),
@@ -540,7 +547,6 @@ def build_solo_contact() -> dict:
 
 
 def add_transcript_to_notes(transcript: str):
-    """Place an accepted transcript in the next available note slot."""
     text = (transcript or "").strip()
     if not text:
         return
@@ -575,7 +581,6 @@ def add_transcript_to_notes(transcript: str):
 # ─────────────────────────────────────────────
 
 def _apply_hubspot_pick(contact: dict, token: str):
-    """Solo mode: 'Use this' button — auto-fills the form from a HubSpot record."""
     p = contact.get("properties", {})
     full_name = f"{p.get('firstname','')} {p.get('lastname','')}".strip()
     if full_name:
@@ -591,16 +596,12 @@ def _apply_hubspot_pick(contact: dict, token: str):
 
 
 def _clear_hubspot_pick():
-    """Solo mode: 'Clear' button — drops the HubSpot association.
-    Leaves the auto-filled form fields intact in case the user wants to keep them."""
     st.session_state.solo_hs_id      = None
     st.session_state.solo_hs_data    = None
     st.session_state.solo_hs_tickets = None
 
 
 def _apply_manual_add():
-    """Group mode: manual 'Add' button — appends an attendee and clears the input fields.
-    Reads from session_state directly since the callback runs before the next render."""
     name = st.session_state.get("group_manual_name", "").strip()
     role = st.session_state.get("group_manual_role", "").strip()
     if not name:
@@ -613,24 +614,30 @@ def _apply_manual_add():
         "hs_id":    None,
         "hs_data":  None,
     })
-    # Safe to clear these widget keys — callback runs before widgets render
     st.session_state.group_manual_name = ""
     st.session_state.group_manual_role = ""
 
 
 def _add_hubspot_attendee(contact: dict, token: str):
-    """Group mode: '+ Add' button on a HubSpot result — appends the attendee."""
     p = contact.get("properties", {})
     tickets = get_contact_tickets(contact["id"], token)
     st.session_state.contacts.append({
-        "name":     f"{p.get('firstname','')} {p.get('lastname','')}".strip() or "(no name)",
-        "agency":   p.get("company") or st.session_state.get("group_agency", ""),
-        "role":     p.get("jobtitle", "") or "",
-        "database": p.get("database_name", "") or "",
-        "hs_id":    contact["id"],
-        "hs_data":  contact,
+        "name":       f"{p.get('firstname','')} {p.get('lastname','')}".strip() or "(no name)",
+        "agency":     p.get("company") or st.session_state.get("group_agency", ""),
+        "role":       p.get("jobtitle", "") or "",
+        "database":   p.get("database_name", "") or "",
+        "hs_id":      contact["id"],
+        "hs_data":    contact,
         "hs_tickets": tickets,
     })
+
+
+def _add_tag():
+    """Tag-add callback — runs before next render so we can clear the widget key."""
+    candidate = st.session_state.get("new_tag_input", "").strip()
+    if candidate and candidate not in st.session_state.tags:
+        st.session_state.tags.append(candidate)
+    st.session_state.new_tag_input = ""
 
 
 # ─────────────────────────────────────────────
@@ -641,26 +648,45 @@ st.title("🎤 Customer Notes")
 
 # Success banner
 if st.session_state.submitted:
-    entry = st.session_state.last_entry or {}
-    note_count = len(entry.get("notes", [])) if entry else 0
-    contact_count = len(entry.get("contacts", [])) if entry else 0
-    st.markdown(
-        f'<div class="success-banner">✅ Saved — {note_count} note(s) for {contact_count} contact(s)</div>',
-        unsafe_allow_html=True
-    )
+    entry        = st.session_state.last_entry or {}
+    note_count   = len(entry.get("notes", []))
+    contact_count = len(entry.get("contacts", []))
+    save_error   = entry.get("save_error")
+    used_csv     = entry.get("fallback_csv", False)
 
-    if entry.get("fallback_csv"):
-        st.markdown('<div class="fallback-banner">⚠️ SharePoint not connected — download below.</div>', unsafe_allow_html=True)
-        csv_header = '"SessionID","NoteIndex","SessionType","PrimaryContact","PrimaryAgency","PrimaryDatabase","Contacts","Destination","EventSource","Tags","NoteText","NoteTimestamp","SubmittedAt"\n'
+    if used_csv:
+        # Confluence didn't take it — show a softer banner so it's clear the
+        # data isn't lost (download is offered below) but write didn't land.
+        st.markdown(
+            f'<div class="fallback-banner">⚠️ Saved locally — Confluence write failed. '
+            f'{note_count} note(s) for {contact_count} contact(s) are below as CSV.</div>',
+            unsafe_allow_html=True,
+        )
+        if save_error:
+            with st.expander("Why did it fail?"):
+                st.code(save_error)
+    else:
+        st.markdown(
+            f'<div class="success-banner">✅ Saved to Confluence — {note_count} note(s) for {contact_count} contact(s)</div>',
+            unsafe_allow_html=True,
+        )
+
+    if used_csv:
+        csv_header = (
+            '"SubmittedAt","PrimaryContact","PrimaryAgency","PrimaryDatabase",'
+            '"EventSource","Tags","NoteText","SessionType","NoteIndex","NoteCount",'
+            '"Contacts","NoteTimestamp","SessionID","Destination"\n'
+        )
         rows = []
         contacts_blob = format_contacts_blob(entry["contacts"])
-        primary = entry["contacts"][0] if entry["contacts"] else {"name":"","agency":"","database":""}
+        primary       = entry["contacts"][0] if entry["contacts"] else {"name":"","agency":"","database":""}
         for i, note in enumerate(entry["notes"], 1):
+            note_safe = note["text"].replace(chr(34), chr(39))
             rows.append(
-                f'"{entry["session_id"]}","{i}","{entry["session_type"]}",'
-                f'"{primary["name"]}","{primary["agency"]}","{primary.get("database","")}","{contacts_blob}",'
-                f'"{entry["destination"]}","{entry["event_source"]}","{", ".join(entry["tags"])}",'
-                f'"{note["text"].replace(chr(34),chr(39))}","{note["timestamp"]}","{entry["submitted_at"]}"\n'
+                f'"{entry["submitted_at"]}","{primary["name"]}","{primary["agency"]}","{primary.get("database","")}",'
+                f'"{entry["event_source"]}","{", ".join(entry["tags"])}","{note_safe}","{entry["session_type"]}",'
+                f'"{i}","{len(entry["notes"])}","{contacts_blob}","{note["timestamp"]}","{entry["session_id"]}",'
+                f'"{entry["destination"]}"\n'
             )
         st.download_button(
             "⬇️ Download as CSV",
@@ -748,7 +774,6 @@ with col_b:
 st.divider()
 hs_token = get_hubspot_token()
 
-# ── SOLO MODE ──
 if st.session_state.mode == "solo":
     st.subheader("Who did you talk to?")
 
@@ -801,7 +826,6 @@ if st.session_state.mode == "solo":
                         with cc2:
                             if is_selected:
                                 st.success("Selected")
-                                # Clear writes only to non-widget keys, so a callback isn't required
                                 st.button(
                                     "Clear",
                                     key=f"clr_{r['id']}",
@@ -809,9 +833,6 @@ if st.session_state.mode == "solo":
                                     on_click=_clear_hubspot_pick,
                                 )
                             else:
-                                # Use this writes to widget keys (solo_name, etc.) — must use
-                                # an on_click callback because the text_input widgets with
-                                # those keys have already rendered earlier in this script run.
                                 st.button(
                                     "Use this",
                                     key=f"use_{r['id']}",
@@ -821,8 +842,6 @@ if st.session_state.mode == "solo":
                                     args=(r, hs_token),
                                 )
 
-
-# ── GROUP MODE ──
 else:
     st.subheader("Group setup")
 
@@ -886,7 +905,6 @@ else:
     with m2:
         st.text_input("Role", key="group_manual_role", label_visibility="collapsed", placeholder="Role (optional)")
     with m3:
-        # Manual add also writes to widget keys (clearing them after add) — needs callback
         st.button(
             "Add",
             use_container_width=True,
@@ -996,89 +1014,52 @@ if st.button("+ Add another note", use_container_width=True):
 
 # ─────────────────────────────────────────────
 # STEP 6 — TAGS
+# Stopgap version: simple text input + Add. No autocomplete, no similarity check.
+# TODO (post-stopgap):
+#   - Restore "Pick existing tag" dropdown sourced from the destination's tag store
+#   - Restore find_similar_tag() check with "did you mean X?" prompt
+#   - Source of existing tags can be either:
+#       (a) SharePoint Tags list (when AD approval comes through), or
+#       (b) parsed from the Tags column of the Confluence notes table
+#   - The `find_similar_tag()` function and TAG_SIMILARITY constant are still
+#     in the file, ready to wire back up.
 # ─────────────────────────────────────────────
 
 st.divider()
 st.subheader("Tags")
-st.caption(f"Topics for this session — saved to the {st.session_state.destination} tag list.")
+st.caption(f"Topics for this session — saved with the {st.session_state.destination} note.")
 
-existing_tags = fetch_tags(st.session_state.destination)
-
+# Selected tag pills (X to remove)
 if st.session_state.tags:
-    cols = st.columns(len(st.session_state.tags) + 1)
+    cols = st.columns(min(len(st.session_state.tags) + 1, 6))
     for i, t in enumerate(st.session_state.tags):
-        with cols[i]:
+        with cols[i % len(cols)]:
             if st.button(f"✕ {t}", key=f"rm_tag_{i}"):
                 st.session_state.tags.remove(t)
                 st.rerun()
 
-pick_col, add_col = st.columns([3, 1])
-with pick_col:
-    available = [t for t in existing_tags if t not in st.session_state.tags]
-    if available:
-        picked = st.selectbox(
-            "Pick existing tag",
-            options=["— Pick existing —"] + available,
-            key="existing_tag_picker",
-        )
-        if picked != "— Pick existing —" and picked not in st.session_state.tags:
-            st.session_state.tags.append(picked)
-            st.rerun()
-    else:
-        st.caption("No existing tags yet for this destination.")
-
-with add_col:
-    if st.button("+ New tag", use_container_width=True):
-        st.session_state.pending_tag_input = "OPEN"
-
-if st.session_state.pending_tag_input == "OPEN":
-    new_tag_text = st.text_input("Type new tag name", key="new_tag_field", placeholder="e.g. reporting")
-    tcol1, tcol2 = st.columns(2)
-    with tcol1:
-        if st.button("Check & add", use_container_width=True, key="check_tag"):
-            candidate = new_tag_text.strip()
-            if candidate:
-                similar = find_similar_tag(candidate, existing_tags)
-                if similar and similar.lower() != candidate.lower():
-                    st.session_state.pending_similar_tag = {"new": candidate, "similar": similar}
-                elif similar:
-                    if similar not in st.session_state.tags:
-                        st.session_state.tags.append(similar)
-                    st.session_state.pending_tag_input = ""
-                    st.rerun()
-                else:
-                    save_new_tag(candidate, st.session_state.destination)
-                    st.session_state.tags.append(candidate)
-                    st.session_state.pending_tag_input = ""
-                    st.rerun()
-    with tcol2:
-        if st.button("Cancel", use_container_width=True, key="cancel_tag"):
-            st.session_state.pending_tag_input = ""
-            st.session_state.pending_similar_tag = None
-            st.rerun()
-
-if st.session_state.pending_similar_tag:
-    s = st.session_state.pending_similar_tag
-    st.warning(f"**Similar tag exists:** `{s['similar']}`  —  did you mean that?")
-    scol1, scol2 = st.columns(2)
-    with scol1:
-        if st.button(f"✓ Use existing: {s['similar']}", use_container_width=True):
-            if s["similar"] not in st.session_state.tags:
-                st.session_state.tags.append(s["similar"])
-            st.session_state.pending_similar_tag = None
-            st.session_state.pending_tag_input = ""
-            st.rerun()
-    with scol2:
-        if st.button(f"+ Add as new: {s['new']}", use_container_width=True):
-            save_new_tag(s["new"], st.session_state.destination)
-            st.session_state.tags.append(s["new"])
-            st.session_state.pending_similar_tag = None
-            st.session_state.pending_tag_input = ""
-            st.rerun()
+# Add a new tag (free-text only during stopgap)
+tcol1, tcol2 = st.columns([4, 1])
+with tcol1:
+    st.text_input(
+        "Add a tag",
+        key="new_tag_input",
+        placeholder="Type a tag and click Add",
+        label_visibility="collapsed",
+    )
+with tcol2:
+    st.button(
+        "Add tag",
+        on_click=_add_tag,
+        use_container_width=True,
+        key="add_tag_btn",
+    )
 
 
 # ─────────────────────────────────────────────
 # STEP 7 — SAVE
+# Tries Confluence first; on any failure, falls back to CSV download so the
+# user never loses what they captured.
 # ─────────────────────────────────────────────
 
 st.divider()
@@ -1114,20 +1095,22 @@ if save_clicked:
             "tags":         st.session_state.tags,
             "submitted_at": datetime.now().isoformat(),
         }
-        with st.spinner(f"Saving {len(valid_notes)} note(s)…"):
-            success, message = save_session_notes(session_data)
+
+        with st.spinner(f"Saving {len(valid_notes)} note(s) to Confluence…"):
+            success, message = save_session_to_confluence(session_data)
 
         if success:
+            # Clean Confluence write
             st.session_state.last_entry = session_data
             st.session_state.submitted  = True
             st.rerun()
-        elif message == "sharepoint_not_configured":
+        else:
+            # Anything went wrong — guarantee data isn't lost by handing back a CSV
             session_data["fallback_csv"] = True
+            session_data["save_error"]   = message
             st.session_state.last_entry  = session_data
             st.session_state.submitted   = True
             st.rerun()
-        else:
-            st.error(f"Save failed: {message}")
 
 
 # ─────────────────────────────────────────────
