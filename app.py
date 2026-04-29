@@ -38,6 +38,16 @@ def get_hubspot_token() -> str | None:
         return None
 
 
+def _contact_sort_key(contact: dict) -> tuple:
+    """Sort contacts alphabetically by last name then first name (case-insensitive).
+    Empty / missing names sort to the bottom so meaningful records stay at top."""
+    p = contact.get("properties", {})
+    last  = (p.get("lastname")  or "").strip().lower()
+    first = (p.get("firstname") or "").strip().lower()
+    # Empty values get a high sort key so they fall to the bottom of the list
+    return (last == "", last, first == "", first)
+
+
 def _search_contacts(filters: list, token: str) -> list:
     if not filters:
         return []
@@ -51,7 +61,11 @@ def _search_contacts(filters: list, token: str) -> list:
         },
         timeout=10,
     )
-    return resp.json().get("results", []) if resp.ok else []
+    if not resp.ok:
+        return []
+    results = resp.json().get("results", [])
+    results.sort(key=_contact_sort_key)
+    return results
 
 
 def search_hubspot_contacts(name: str, agency: str, token: str) -> list:
@@ -705,7 +719,7 @@ if st.session_state.mode == "solo":
         else:
             # Show count + caption when there's possible ambiguity
             if len(results) > 1:
-                st.caption(f"**{len(results)} possible matches** — review carefully. Each card shows agency, database, email, and role to help you pick the right record.")
+                st.caption(f"**{len(results)} possible matches** — sorted alphabetically by last name. Each card shows agency, database, email, and role to help you pick the right record.")
 
             # Render each candidate as a labeled card with a select button (radio-replacement
             # so missing fields are visible, not hidden behind a one-line truncated label)
@@ -762,7 +776,7 @@ else:
         if not results:
             st.info("No contacts found in HubSpot for that agency. Add people manually below.")
         else:
-            st.markdown(f"**{len(results)} contact(s) at {st.session_state.group_agency}:**")
+            st.markdown(f"**{len(results)} contact(s) at {st.session_state.group_agency}** — sorted alphabetically by last name:")
             added_ids = {ct.get("hs_id") for ct in st.session_state.contacts if ct.get("hs_id")}
             for r in results:
                 p = r["properties"]
