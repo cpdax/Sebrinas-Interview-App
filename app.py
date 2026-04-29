@@ -27,6 +27,17 @@ HS_CONTACT_PROPS = [
 NOTES_LIST_NAME = {"Procare": "PROCARE_NOTES_LIST", "ChildPlus": "CHILDPLUS_NOTES_LIST"}
 TAGS_LIST_NAME  = {"Procare": "PROCARE_TAGS_LIST",  "ChildPlus": "CHILDPLUS_TAGS_LIST"}
 
+# Solo-mode widget keys — these are the source of truth for the contact form.
+# When a HubSpot result is selected, we write to these keys directly so the
+# text inputs reflect the auto-filled values on the next rerun.
+SOLO_FIELD_KEYS = {
+    "name":     "solo_name",
+    "agency":   "solo_agency",
+    "role":     "solo_role",
+    "database": "solo_database",  # internal — not bound to a visible widget
+}
+
+
 # ─────────────────────────────────────────────
 # HUBSPOT HELPERS
 # ─────────────────────────────────────────────
@@ -44,7 +55,6 @@ def _contact_sort_key(contact: dict) -> tuple:
     p = contact.get("properties", {})
     last  = (p.get("lastname")  or "").strip().lower()
     first = (p.get("firstname") or "").strip().lower()
-    # Empty values get a high sort key so they fall to the bottom of the list
     return (last == "", last, first == "", first)
 
 
@@ -102,7 +112,6 @@ def render_contact_card(props: dict) -> str:
         v = (value or "").strip()
         return v if v else f":gray[{missing_label}]"
 
-    # ChildPlus identifiers — show whichever is populated; prefer database name (most readable)
     db_id_parts = []
     if (props.get("database_name") or "").strip():
         db_id_parts.append(props["database_name"].strip())
@@ -419,7 +428,7 @@ def find_similar_tag(new_tag: str, existing_tags: list[str]) -> str | None:
     best_match, best_score = None, 0.0
     for existing in existing_tags:
         if existing.lower() == new_norm:
-            return existing  # exact (case-insensitive) match
+            return existing
         score = SequenceMatcher(None, new_norm, existing.lower()).ratio()
         if score > best_score:
             best_score, best_match = score, existing
@@ -571,6 +580,9 @@ def init_state():
         "contacts":        [],          # list of dicts: {name, agency, role, database, hs_id, hs_data}
         "solo_search_run": False,
         "solo_results":    None,
+        "solo_hs_id":      None,        # currently-selected HubSpot contact ID
+        "solo_hs_data":    None,        # full HubSpot record for selected contact
+        "solo_hs_tickets": None,        # tickets for selected contact
         "group_search_run": False,
         "group_results":   None,
         "group_agency":    "",
@@ -581,10 +593,14 @@ def init_state():
         "notes":           [{"text": "", "timestamp": datetime.now().isoformat()}],
         "tags":            [],
         "pending_tag_input": "",
-        "pending_similar_tag": None,  # {new, similar}
-        "hs_context_view": None,       # contact index (int) for group mode picker
+        "pending_similar_tag": None,
         "submitted":       False,
         "last_entry":      None,
+        # Solo-mode contact fields — these are the source of truth
+        "solo_name":       "",
+        "solo_agency":     "",
+        "solo_role":       "",
+        "solo_database":   "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -598,6 +614,20 @@ def reset_all():
     for k in keys:
         del st.session_state[k]
     init_state()
+
+
+def build_solo_contact() -> dict:
+    """Read the solo contact's current state from session_state widget keys.
+    Single source of truth — used for both display and validation."""
+    return {
+        "name":     st.session_state.get("solo_name", "").strip(),
+        "agency":   st.session_state.get("solo_agency", "").strip(),
+        "role":     st.session_state.get("solo_role", "").strip(),
+        "database": st.session_state.get("solo_database", "").strip(),
+        "hs_id":    st.session_state.get("solo_hs_id"),
+        "hs_data":  st.session_state.get("solo_hs_data"),
+        "hs_tickets": st.session_state.get("solo_hs_tickets"),
+    }
 
 
 # ─────────────────────────────────────────────
@@ -653,7 +683,6 @@ if st.session_state.mode is None:
         st.markdown('<div class="mode-card">', unsafe_allow_html=True)
         if st.button("🧑 Solo conversation\n\n*One person*", use_container_width=True, key="pick_solo"):
             st.session_state.mode = "solo"
-            st.session_state.contacts = [{"name":"","agency":"","role":"","database":"","hs_id":None,"hs_data":None}]
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
@@ -686,15 +715,17 @@ hs_token = get_hubspot_token()
 # ── SOLO MODE ──
 if st.session_state.mode == "solo":
     st.subheader("Who did you talk to?")
-    c = st.session_state.contacts[0]
 
+    # Text inputs read from session_state via their keys (no `value=` argument).
+    # When HubSpot auto-fill writes to st.session_state["solo_agency"] etc., the
+    # widget picks up the new value on the next rerun automatically.
     colA, colB = st.columns([1, 1])
     with colA:
-        c["name"] = st.text_input("Name *", value=c.get("name",""), placeholder="First and last name", key="solo_name")
+        st.text_input("Name *", placeholder="First and last name", key="solo_name")
     with colB:
-        c["agency"] = st.text_input("Organization / Agency *", value=c.get("agency",""), placeholder="e.g. Bright Horizons", key="solo_agency")
+        st.text_input("Organization / Agency *", placeholder="e.g. Bright Horizons", key="solo_agency")
 
-    c["role"] = st.text_input("Title / Role", value=c.get("role",""), placeholder="e.g. Executive Director", key="solo_role")
+    st.text_input("Title / Role", placeholder="e.g. Executive Director", key="solo_role")
 
     # HubSpot lookup
     with st.container():
@@ -706,10 +737,16 @@ if st.session_state.mode == "solo":
             else:
                 st.caption("Find existing contact to pre-fill and load support history.")
         with h2:
-            can_search = hs_token and (c["name"].strip() or c["agency"].strip())
+            can_search = hs_token and (
+                st.session_state.solo_name.strip() or st.session_state.solo_agency.strip()
+            )
             if st.button("Search", disabled=not can_search, use_container_width=True, key="solo_search"):
                 with st.spinner("Searching HubSpot…"):
-                    st.session_state.solo_results = search_hubspot_contacts(c["name"], c["agency"], hs_token)
+                    st.session_state.solo_results = search_hubspot_contacts(
+                        st.session_state.solo_name,
+                        st.session_state.solo_agency,
+                        hs_token,
+                    )
                     st.session_state.solo_search_run = True
 
     if st.session_state.solo_search_run:
@@ -717,13 +754,10 @@ if st.session_state.mode == "solo":
         if not results:
             st.info("No match identified")
         else:
-            # Show count + caption when there's possible ambiguity
             if len(results) > 1:
                 st.caption(f"**{len(results)} possible matches** — sorted alphabetically by last name. Each card shows agency, database, email, and role to help you pick the right record.")
 
-            # Render each candidate as a labeled card with a select button (radio-replacement
-            # so missing fields are visible, not hidden behind a one-line truncated label)
-            current_id = c.get("hs_id")
+            current_id = st.session_state.solo_hs_id
             for r in results:
                 p = r["properties"]
                 is_selected = (r["id"] == current_id)
@@ -735,18 +769,27 @@ if st.session_state.mode == "solo":
                         if is_selected:
                             st.success("Selected")
                             if st.button("Clear", key=f"clr_{r['id']}", use_container_width=True):
-                                c["hs_id"] = None; c["hs_data"] = None; c.pop("hs_tickets", None)
+                                st.session_state.solo_hs_id      = None
+                                st.session_state.solo_hs_data    = None
+                                st.session_state.solo_hs_tickets = None
                                 st.rerun()
                         else:
                             if st.button("Use this", key=f"use_{r['id']}", use_container_width=True, type="primary"):
-                                c["name"]     = f"{p.get('firstname','')} {p.get('lastname','')}".strip() or c["name"]
-                                if p.get("company"):       c["agency"]   = p["company"]
-                                if p.get("jobtitle"):      c["role"]     = p["jobtitle"]
-                                if p.get("database_name"): c["database"] = p["database_name"]
-                                c["hs_id"]   = r["id"]
-                                c["hs_data"] = r
+                                # Write to widget keys directly so the text inputs reflect
+                                # the auto-filled values on rerun. This is the canonical
+                                # Streamlit pattern for "auto-fill a form."
+                                full_name = f"{p.get('firstname','')} {p.get('lastname','')}".strip()
+                                if full_name:
+                                    st.session_state.solo_name = full_name
+                                if p.get("company"):
+                                    st.session_state.solo_agency = p["company"]
+                                if p.get("jobtitle"):
+                                    st.session_state.solo_role = p["jobtitle"]
+                                st.session_state.solo_database = p.get("database_name") or ""
+                                st.session_state.solo_hs_id    = r["id"]
+                                st.session_state.solo_hs_data  = r
                                 with st.spinner("Loading HubSpot history…"):
-                                    c["hs_tickets"] = get_contact_tickets(r["id"], hs_token)
+                                    st.session_state.solo_hs_tickets = get_contact_tickets(r["id"], hs_token)
                                 st.rerun()
 
 
@@ -904,7 +947,6 @@ st.caption(f"Topics for this session. Separate by product line (Procare vs Child
 
 existing_tags = fetch_tags(st.session_state.destination)
 
-# Selected pills
 if st.session_state.tags:
     cols = st.columns(len(st.session_state.tags) + 1)
     for i, t in enumerate(st.session_state.tags):
@@ -913,7 +955,6 @@ if st.session_state.tags:
                 st.session_state.tags.remove(t)
                 st.rerun()
 
-# Tag picker: existing tags + freeform input
 pick_col, add_col = st.columns([3, 1])
 with pick_col:
     available = [t for t in existing_tags if t not in st.session_state.tags]
@@ -943,7 +984,7 @@ if st.session_state.pending_tag_input == "OPEN":
                 similar = find_similar_tag(candidate, existing_tags)
                 if similar and similar.lower() != candidate.lower():
                     st.session_state.pending_similar_tag = {"new": candidate, "similar": similar}
-                elif similar:  # exact match (case-insensitive)
+                elif similar:
                     if similar not in st.session_state.tags:
                         st.session_state.tags.append(similar)
                     st.session_state.pending_tag_input = ""
@@ -959,7 +1000,6 @@ if st.session_state.pending_tag_input == "OPEN":
             st.session_state.pending_similar_tag = None
             st.rerun()
 
-# Similar tag prompt
 if st.session_state.pending_similar_tag:
     s = st.session_state.pending_similar_tag
     st.warning(f"**Similar tag exists:** `{s['similar']}`  —  did you mean that?")
@@ -991,9 +1031,15 @@ save_clicked = st.button("💾 Save session", use_container_width=True, key="sav
 st.markdown('</div>', unsafe_allow_html=True)
 
 if save_clicked:
-    # Validation
+    # Build the contact list at save time from the canonical source — for solo
+    # mode that's the widget keys, for group it's already in st.session_state.contacts.
+    if st.session_state.mode == "solo":
+        contacts_to_save = [build_solo_contact()]
+    else:
+        contacts_to_save = st.session_state.contacts
+
     errors = []
-    valid_contacts = [c for c in st.session_state.contacts if c.get("name","").strip() and c.get("agency","").strip()]
+    valid_contacts = [c for c in contacts_to_save if c.get("name","").strip() and c.get("agency","").strip()]
     if not valid_contacts:
         errors.append("At least one contact with name and agency is required.")
     valid_notes = [n for n in st.session_state.notes if n["text"].strip()]
@@ -1033,7 +1079,15 @@ if save_clicked:
 # HUBSPOT CONTEXT (BOTTOM)
 # ─────────────────────────────────────────────
 
-hs_contacts = [c for c in st.session_state.contacts if c.get("hs_id")]
+# Build the list of contacts with HubSpot data — for solo mode pull from
+# session_state widget keys, for group mode pull from the contacts list.
+hs_contacts = []
+if st.session_state.mode == "solo":
+    if st.session_state.solo_hs_id and st.session_state.solo_hs_data:
+        hs_contacts = [build_solo_contact()]
+else:
+    hs_contacts = [c for c in st.session_state.contacts if c.get("hs_id")]
+
 if hs_contacts:
     st.divider()
     st.subheader("📋 HubSpot Context")
