@@ -509,8 +509,8 @@ def init_state():
         "solo_role":       "",
         "solo_database":   "",
         # Audio recording state
-        "pending_transcript": None,   # transcript awaiting user review/accept
-        "recorder_counter":   0,      # bumped after each accept/discard to reset recorder
+        "pending_transcript": None,
+        "recorder_counter":   0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -540,18 +540,11 @@ def build_solo_contact() -> dict:
 
 
 def add_transcript_to_notes(transcript: str):
-    """Place an accepted transcript in the next available note slot.
-
-    Rule: 'open' = a note whose current text is empty/whitespace.
-    If at least one note is open, fill the first one. Otherwise append a new note.
-    Never overwrites a note that the user has typed in.
-    """
+    """Place an accepted transcript in the next available note slot."""
     text = (transcript or "").strip()
     if not text:
         return
 
-    # Look at the live widget value first (what the user has actually typed),
-    # falling back to the dict for newly-added notes that haven't rendered yet.
     def note_is_open(idx: int) -> bool:
         widget_key = f"note_text_{idx}"
         if widget_key in st.session_state:
@@ -565,18 +558,79 @@ def add_transcript_to_notes(transcript: str):
 
     now_ts = datetime.now().isoformat()
     if empty_idx is not None:
-        # Fill the open slot. Set BOTH the dict and the widget key so the text_area
-        # reflects the new value on the next render (Streamlit widget keys override
-        # the `value=` argument once they exist).
         st.session_state.notes[empty_idx]["text"] = text
         st.session_state.notes[empty_idx]["timestamp"] = now_ts
         st.session_state[f"note_text_{empty_idx}"] = text
     else:
-        # Append a brand-new note. Pre-seed the widget key so the text_area for
-        # this new index shows the transcript on its first render.
         new_idx = len(st.session_state.notes)
         st.session_state.notes.append({"text": text, "timestamp": now_ts})
         st.session_state[f"note_text_{new_idx}"] = text
+
+
+# ─────────────────────────────────────────────
+# CALLBACKS
+# Streamlit forbids writing to a widget key after the widget has rendered in the
+# same script run. Callbacks (on_click) execute BEFORE the next script run starts,
+# so writes to widget keys (solo_name, solo_agency, etc.) happen safely there.
+# ─────────────────────────────────────────────
+
+def _apply_hubspot_pick(contact: dict, token: str):
+    """Solo mode: 'Use this' button — auto-fills the form from a HubSpot record."""
+    p = contact.get("properties", {})
+    full_name = f"{p.get('firstname','')} {p.get('lastname','')}".strip()
+    if full_name:
+        st.session_state.solo_name = full_name
+    if p.get("company"):
+        st.session_state.solo_agency = p["company"]
+    if p.get("jobtitle"):
+        st.session_state.solo_role = p["jobtitle"]
+    st.session_state.solo_database   = p.get("database_name") or ""
+    st.session_state.solo_hs_id      = contact["id"]
+    st.session_state.solo_hs_data    = contact
+    st.session_state.solo_hs_tickets = get_contact_tickets(contact["id"], token)
+
+
+def _clear_hubspot_pick():
+    """Solo mode: 'Clear' button — drops the HubSpot association.
+    Leaves the auto-filled form fields intact in case the user wants to keep them."""
+    st.session_state.solo_hs_id      = None
+    st.session_state.solo_hs_data    = None
+    st.session_state.solo_hs_tickets = None
+
+
+def _apply_manual_add():
+    """Group mode: manual 'Add' button — appends an attendee and clears the input fields.
+    Reads from session_state directly since the callback runs before the next render."""
+    name = st.session_state.get("group_manual_name", "").strip()
+    role = st.session_state.get("group_manual_role", "").strip()
+    if not name:
+        return
+    st.session_state.contacts.append({
+        "name":     name,
+        "agency":   st.session_state.get("group_agency", ""),
+        "role":     role,
+        "database": "",
+        "hs_id":    None,
+        "hs_data":  None,
+    })
+    # Safe to clear these widget keys — callback runs before widgets render
+    st.session_state.group_manual_name = ""
+    st.session_state.group_manual_role = ""
+
+
+def _add_hubspot_attendee(contact: dict, token: str):
+    """Group mode: '+ Add' button on a HubSpot result — appends the attendee."""
+    p = contact.get("properties", {})
+    tickets = get_contact_tickets(contact["id"], token)
+    st.session_state.contacts.append({
+        "name":     f"{p.get('firstname','')} {p.get('lastname','')}".strip() or "(no name)",
+        "agency":   p.get("company") or st.session_state.get("group_agency", ""),
+        "role":     p.get("jobtitle", "") or "",
+        "database": p.get("database_name", "") or "",
+        "hs_id":    contact["id"],
+        "hs_data":  contact,
+        "hs_tickets": tickets,
+    })
 
 
 # ─────────────────────────────────────────────
@@ -747,26 +801,25 @@ if st.session_state.mode == "solo":
                         with cc2:
                             if is_selected:
                                 st.success("Selected")
-                                if st.button("Clear", key=f"clr_{r['id']}", use_container_width=True):
-                                    st.session_state.solo_hs_id      = None
-                                    st.session_state.solo_hs_data    = None
-                                    st.session_state.solo_hs_tickets = None
-                                    st.rerun()
+                                # Clear writes only to non-widget keys, so a callback isn't required
+                                st.button(
+                                    "Clear",
+                                    key=f"clr_{r['id']}",
+                                    use_container_width=True,
+                                    on_click=_clear_hubspot_pick,
+                                )
                             else:
-                                if st.button("Use this", key=f"use_{r['id']}", use_container_width=True, type="primary"):
-                                    full_name = f"{p.get('firstname','')} {p.get('lastname','')}".strip()
-                                    if full_name:
-                                        st.session_state.solo_name = full_name
-                                    if p.get("company"):
-                                        st.session_state.solo_agency = p["company"]
-                                    if p.get("jobtitle"):
-                                        st.session_state.solo_role = p["jobtitle"]
-                                    st.session_state.solo_database = p.get("database_name") or ""
-                                    st.session_state.solo_hs_id    = r["id"]
-                                    st.session_state.solo_hs_data  = r
-                                    with st.spinner("Loading HubSpot history…"):
-                                        st.session_state.solo_hs_tickets = get_contact_tickets(r["id"], hs_token)
-                                    st.rerun()
+                                # Use this writes to widget keys (solo_name, etc.) — must use
+                                # an on_click callback because the text_input widgets with
+                                # those keys have already rendered earlier in this script run.
+                                st.button(
+                                    "Use this",
+                                    key=f"use_{r['id']}",
+                                    use_container_width=True,
+                                    type="primary",
+                                    on_click=_apply_hubspot_pick,
+                                    args=(r, hs_token),
+                                )
 
 
 # ── GROUP MODE ──
@@ -813,19 +866,13 @@ else:
                             if is_added:
                                 st.markdown("✓ Added")
                             else:
-                                if st.button("+ Add", key=f"add_{r['id']}", use_container_width=True):
-                                    with st.spinner("Loading…"):
-                                        tickets = get_contact_tickets(r["id"], hs_token)
-                                    st.session_state.contacts.append({
-                                        "name": f"{p.get('firstname','')} {p.get('lastname','')}".strip() or "(no name)",
-                                        "agency": p.get("company") or st.session_state.group_agency,
-                                        "role": p.get("jobtitle","") or "",
-                                        "database": p.get("database_name","") or "",
-                                        "hs_id": r["id"],
-                                        "hs_data": r,
-                                        "hs_tickets": tickets,
-                                    })
-                                    st.rerun()
+                                st.button(
+                                    "+ Add",
+                                    key=f"add_{r['id']}",
+                                    use_container_width=True,
+                                    on_click=_add_hubspot_attendee,
+                                    args=(r, hs_token),
+                                )
 
         st.divider()
         st.markdown("**+ Add someone not in HubSpot**")
@@ -835,23 +882,17 @@ else:
 
     m1, m2, m3 = st.columns([2, 2, 1])
     with m1:
-        manual_name = st.text_input("Name", key="group_manual_name", label_visibility="collapsed", placeholder="Name")
+        st.text_input("Name", key="group_manual_name", label_visibility="collapsed", placeholder="Name")
     with m2:
-        manual_role = st.text_input("Role", key="group_manual_role", label_visibility="collapsed", placeholder="Role (optional)")
+        st.text_input("Role", key="group_manual_role", label_visibility="collapsed", placeholder="Role (optional)")
     with m3:
-        if st.button("Add", use_container_width=True, key="manual_add"):
-            if manual_name.strip():
-                st.session_state.contacts.append({
-                    "name": manual_name.strip(),
-                    "agency": st.session_state.group_agency,
-                    "role": manual_role.strip(),
-                    "database": "",
-                    "hs_id": None,
-                    "hs_data": None,
-                })
-                st.session_state.group_manual_name = ""
-                st.session_state.group_manual_role = ""
-                st.rerun()
+        # Manual add also writes to widget keys (clearing them after add) — needs callback
+        st.button(
+            "Add",
+            use_container_width=True,
+            key="manual_add",
+            on_click=_apply_manual_add,
+        )
 
     if st.session_state.contacts:
         st.divider()
@@ -888,12 +929,10 @@ st.selectbox(
 st.divider()
 st.subheader("Notes")
 
-# ── Audio capture: record → review → confirm → goes into next open note ──
 with st.container(border=True):
     st.markdown("**🎙 Record a quote or thought**")
     st.caption("Tap to record, tap again to stop. Your voice from the device's mic — not call audio.")
 
-    # Show the recorder unless we're already reviewing a transcript
     if st.session_state.pending_transcript is None:
         new_text = speech_to_text(
             start_prompt="🎙  Start recording",
@@ -907,7 +946,6 @@ with st.container(border=True):
             st.session_state.pending_transcript = new_text
             st.rerun()
     else:
-        # Review UI: edit transcript, then accept or discard
         st.markdown("**Review what you said** — edit if anything is off, then add it to your notes.")
         edited = st.text_area(
             "Transcript",
@@ -922,7 +960,6 @@ with st.container(border=True):
                 add_transcript_to_notes(edited)
                 st.session_state.pending_transcript = None
                 st.session_state.recorder_counter += 1
-                # Drop the review widget's key so it doesn't carry stale text
                 st.session_state.pop("transcript_review_text", None)
                 st.rerun()
         with rcol2:
@@ -932,7 +969,6 @@ with st.container(border=True):
                 st.session_state.pop("transcript_review_text", None)
                 st.rerun()
 
-# ── Notes list ──
 for i, note in enumerate(st.session_state.notes):
     with st.container():
         st.markdown(f'<div class="mode-label">Note {i+1}</div>', unsafe_allow_html=True)
@@ -950,7 +986,6 @@ for i, note in enumerate(st.session_state.notes):
             if len(st.session_state.notes) > 1:
                 if st.button("🗑", key=f"rm_note_{i}", help="Remove this note"):
                     st.session_state.notes.pop(i)
-                    # Clean up the widget key for the deleted slot
                     st.session_state.pop(f"note_text_{i}", None)
                     st.rerun()
 
