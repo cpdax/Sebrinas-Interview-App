@@ -16,6 +16,14 @@ TICKET_DAYS         = 90
 TICKET_MAX          = 5
 TAG_SIMILARITY      = 0.75  # 75% similarity threshold for "did you mean?"
 
+# HubSpot contact properties pulled on every search.
+# Includes ChildPlus-specific identifiers (database_name, license, IKN) so that
+# duplicate / similar contacts can be visually disambiguated by the user.
+HS_CONTACT_PROPS = [
+    "firstname", "lastname", "email", "company", "phone", "jobtitle",
+    "database_name", "childplus_license_number", "ikn__c",
+]
+
 NOTES_LIST_NAME = {"Procare": "PROCARE_NOTES_LIST", "ChildPlus": "CHILDPLUS_NOTES_LIST"}
 TAGS_LIST_NAME  = {"Procare": "PROCARE_TAGS_LIST",  "ChildPlus": "CHILDPLUS_TAGS_LIST"}
 
@@ -38,7 +46,7 @@ def _search_contacts(filters: list, token: str) -> list:
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json={
             "filterGroups": [{"filters": filters}],
-            "properties": ["firstname", "lastname", "email", "company", "phone", "jobtitle"],
+            "properties": HS_CONTACT_PROPS,
             "limit": 25,
         },
         timeout=10,
@@ -68,6 +76,36 @@ def search_contacts_by_agency(agency: str, token: str) -> list:
         [{"propertyName": "company", "operator": "CONTAINS_TOKEN", "value": agency.strip()}],
         token,
     )
+
+
+def render_contact_card(props: dict) -> str:
+    """Build the markdown card body shown in solo search results & group attendee list.
+    Always renders Agency, Database, Email, Role rows, marking missing fields explicitly
+    so users can disambiguate similar/duplicate contacts."""
+    full_name = f"{props.get('firstname','').strip()} {props.get('lastname','').strip()}".strip() or "(no name)"
+
+    def field(value, missing_label="—"):
+        v = (value or "").strip()
+        return v if v else f":gray[{missing_label}]"
+
+    # ChildPlus identifiers — show whichever is populated; prefer database name (most readable)
+    db_id_parts = []
+    if (props.get("database_name") or "").strip():
+        db_id_parts.append(props["database_name"].strip())
+    if (props.get("ikn__c") or "").strip():
+        db_id_parts.append(f"IKN {props['ikn__c'].strip()}")
+    if (props.get("childplus_license_number") or "").strip():
+        db_id_parts.append(f"Lic {props['childplus_license_number'].strip()}")
+    db_display = " · ".join(db_id_parts) if db_id_parts else ":gray[—]"
+
+    lines = [
+        f"**{full_name}**",
+        f"🏢 **Agency:** {field(props.get('company'), '— no agency on record')}",
+        f"🗄 **Database / ID:** {db_display}",
+        f"✉️ **Email:** {field(props.get('email'), '— no email on record')}",
+        f"💼 **Role:** {field(props.get('jobtitle'), '— no role on record')}",
+    ]
+    return "  \n".join(lines)
 
 
 def get_contact_tickets(contact_id: str, token: str) -> list:
@@ -177,6 +215,7 @@ def ensure_notes_list(site_id: str, list_name: str, token: str) -> str | None:
                 {"name": "Contacts",        "text": {"allowMultipleLines": True}},
                 {"name": "PrimaryContact",  "text": {}},
                 {"name": "PrimaryAgency",   "text": {}},
+                {"name": "PrimaryDatabase", "text": {}},
                 {"name": "Destination",     "choice": {"choices": DESTINATION_OPTIONS}},
                 {"name": "EventSource",     "choice": {"choices": SOURCE_OPTIONS}},
                 {"name": "Tags",            "text": {}},
@@ -307,24 +346,25 @@ def save_session_notes(session_data: dict) -> tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     notes   = session_data["notes"]
     contacts_blob = format_contacts_blob(session_data["contacts"])
-    primary       = session_data["contacts"][0] if session_data["contacts"] else {"name": "", "agency": ""}
+    primary       = session_data["contacts"][0] if session_data["contacts"] else {"name": "", "agency": "", "database": ""}
 
     for idx, note in enumerate(notes, start=1):
         payload = {"fields": {
-            "Title":          f"{primary['name']} — note {idx}/{len(notes)}",
-            "SessionID":      session_data["session_id"],
-            "NoteIndex":      idx,
-            "NoteCount":      len(notes),
-            "SessionType":    session_data["session_type"],
-            "Contacts":       contacts_blob,
-            "PrimaryContact": primary["name"],
-            "PrimaryAgency":  primary["agency"],
-            "Destination":    dest,
-            "EventSource":    session_data["event_source"],
-            "Tags":           ", ".join(session_data["tags"]),
-            "NoteText":       note["text"],
-            "NoteTimestamp":  note["timestamp"],
-            "SubmittedAt":    session_data["submitted_at"],
+            "Title":           f"{primary['name']} — note {idx}/{len(notes)}",
+            "SessionID":       session_data["session_id"],
+            "NoteIndex":       idx,
+            "NoteCount":       len(notes),
+            "SessionType":     session_data["session_type"],
+            "Contacts":        contacts_blob,
+            "PrimaryContact":  primary["name"],
+            "PrimaryAgency":   primary["agency"],
+            "PrimaryDatabase": primary.get("database", ""),
+            "Destination":     dest,
+            "EventSource":     session_data["event_source"],
+            "Tags":            ", ".join(session_data["tags"]),
+            "NoteText":        note["text"],
+            "NoteTimestamp":   note["timestamp"],
+            "SubmittedAt":     session_data["submitted_at"],
         }}
         resp = requests.post(
             f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items",
@@ -342,8 +382,14 @@ def format_contacts_blob(contacts: list[dict]) -> str:
         bits = [c.get("name", "").strip()]
         if c.get("role"):
             bits[0] += f" ({c['role']})"
-        if c.get("agency"):
-            bits.append(f"@ {c['agency']}")
+        agency_part = c.get("agency", "").strip()
+        db_part = c.get("database", "").strip()
+        if agency_part and db_part:
+            bits.append(f"@ {agency_part} [{db_part}]")
+        elif agency_part:
+            bits.append(f"@ {agency_part}")
+        elif db_part:
+            bits.append(f"@ [{db_part}]")
         parts.append(" ".join(bits))
     return "; ".join(parts)
 
@@ -508,7 +554,7 @@ def init_state():
     defaults = {
         "mode":            None,       # None | "solo" | "group"
         "session_id":      str(uuid.uuid4()),
-        "contacts":        [],          # list of dicts: {name, agency, role, hs_id, hs_data}
+        "contacts":        [],          # list of dicts: {name, agency, role, database, hs_id, hs_data}
         "solo_search_run": False,
         "solo_results":    None,
         "group_search_run": False,
@@ -558,14 +604,14 @@ if st.session_state.submitted:
 
     if entry.get("fallback_csv"):
         st.markdown('<div class="fallback-banner">⚠️ SharePoint not connected — download below.</div>', unsafe_allow_html=True)
-        csv_header = '"SessionID","NoteIndex","SessionType","PrimaryContact","PrimaryAgency","Contacts","Destination","EventSource","Tags","NoteText","NoteTimestamp","SubmittedAt"\n'
+        csv_header = '"SessionID","NoteIndex","SessionType","PrimaryContact","PrimaryAgency","PrimaryDatabase","Contacts","Destination","EventSource","Tags","NoteText","NoteTimestamp","SubmittedAt"\n'
         rows = []
         contacts_blob = format_contacts_blob(entry["contacts"])
-        primary = entry["contacts"][0] if entry["contacts"] else {"name":"","agency":""}
+        primary = entry["contacts"][0] if entry["contacts"] else {"name":"","agency":"","database":""}
         for i, note in enumerate(entry["notes"], 1):
             rows.append(
                 f'"{entry["session_id"]}","{i}","{entry["session_type"]}",'
-                f'"{primary["name"]}","{primary["agency"]}","{contacts_blob}",'
+                f'"{primary["name"]}","{primary["agency"]}","{primary.get("database","")}","{contacts_blob}",'
                 f'"{entry["destination"]}","{entry["event_source"]}","{", ".join(entry["tags"])}",'
                 f'"{note["text"].replace(chr(34),chr(39))}","{note["timestamp"]}","{entry["submitted_at"]}"\n'
             )
@@ -593,7 +639,7 @@ if st.session_state.mode is None:
         st.markdown('<div class="mode-card">', unsafe_allow_html=True)
         if st.button("🧑 Solo conversation\n\n*One person*", use_container_width=True, key="pick_solo"):
             st.session_state.mode = "solo"
-            st.session_state.contacts = [{"name":"","agency":"","role":"","hs_id":None,"hs_data":None}]
+            st.session_state.contacts = [{"name":"","agency":"","role":"","database":"","hs_id":None,"hs_data":None}]
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
@@ -657,29 +703,37 @@ if st.session_state.mode == "solo":
         if not results:
             st.info("No match identified")
         else:
-            options = []
+            # Show count + caption when there's possible ambiguity
+            if len(results) > 1:
+                st.caption(f"**{len(results)} possible matches** — review carefully. Each card shows agency, database, email, and role to help you pick the right record.")
+
+            # Render each candidate as a labeled card with a select button (radio-replacement
+            # so missing fields are visible, not hidden behind a one-line truncated label)
+            current_id = c.get("hs_id")
             for r in results:
                 p = r["properties"]
-                label = f"{p.get('firstname','')} {p.get('lastname','')}".strip() or "(no name)"
-                if p.get("company"):  label += f"  ·  {p['company']}"
-                if p.get("jobtitle"): label += f"  ·  {p['jobtitle']}"
-                options.append(label)
-            options.append("None of these")
-            choice = st.radio("Select the right person:", options, key="solo_choice")
-            if choice != "None of these":
-                chosen = results[options.index(choice)]
-                if c.get("hs_id") != chosen["id"]:
-                    p = chosen["properties"]
-                    c["name"]   = f"{p.get('firstname','')} {p.get('lastname','')}".strip() or c["name"]
-                    if p.get("company"):  c["agency"] = p["company"]
-                    if p.get("jobtitle"): c["role"]   = p["jobtitle"]
-                    c["hs_id"]   = chosen["id"]
-                    c["hs_data"] = chosen
-                    with st.spinner("Loading HubSpot history…"):
-                        c["hs_tickets"] = get_contact_tickets(chosen["id"], hs_token)
-                    st.rerun()
-            else:
-                c["hs_id"] = None; c["hs_data"] = None; c.pop("hs_tickets", None)
+                is_selected = (r["id"] == current_id)
+                with st.container(border=True):
+                    cc1, cc2 = st.columns([5, 1])
+                    with cc1:
+                        st.markdown(render_contact_card(p))
+                    with cc2:
+                        if is_selected:
+                            st.success("Selected")
+                            if st.button("Clear", key=f"clr_{r['id']}", use_container_width=True):
+                                c["hs_id"] = None; c["hs_data"] = None; c.pop("hs_tickets", None)
+                                st.rerun()
+                        else:
+                            if st.button("Use this", key=f"use_{r['id']}", use_container_width=True, type="primary"):
+                                c["name"]     = f"{p.get('firstname','')} {p.get('lastname','')}".strip() or c["name"]
+                                if p.get("company"):       c["agency"]   = p["company"]
+                                if p.get("jobtitle"):      c["role"]     = p["jobtitle"]
+                                if p.get("database_name"): c["database"] = p["database_name"]
+                                c["hs_id"]   = r["id"]
+                                c["hs_data"] = r
+                                with st.spinner("Loading HubSpot history…"):
+                                    c["hs_tickets"] = get_contact_tickets(r["id"], hs_token)
+                                st.rerun()
 
 
 # ── GROUP MODE ──
@@ -709,31 +763,31 @@ else:
             st.info("No contacts found in HubSpot for that agency. Add people manually below.")
         else:
             st.markdown(f"**{len(results)} contact(s) at {st.session_state.group_agency}:**")
-            added_ids = {c.get("hs_id") for c in st.session_state.contacts if c.get("hs_id")}
+            added_ids = {ct.get("hs_id") for ct in st.session_state.contacts if ct.get("hs_id")}
             for r in results:
                 p = r["properties"]
-                label = f"{p.get('firstname','')} {p.get('lastname','')}".strip() or "(no name)"
-                meta  = p.get("jobtitle", "") or "(no title)"
                 is_added = r["id"] in added_ids
-                cols = st.columns([5, 1])
-                with cols[0]:
-                    st.markdown(f"**{label}** · *{meta}*")
-                with cols[1]:
-                    if is_added:
-                        st.markdown("✓ Added")
-                    else:
-                        if st.button("+ Add", key=f"add_{r['id']}"):
-                            with st.spinner("Loading…"):
-                                tickets = get_contact_tickets(r["id"], hs_token)
-                            st.session_state.contacts.append({
-                                "name": label,
-                                "agency": p.get("company") or st.session_state.group_agency,
-                                "role": p.get("jobtitle",""),
-                                "hs_id": r["id"],
-                                "hs_data": r,
-                                "hs_tickets": tickets,
-                            })
-                            st.rerun()
+                with st.container(border=True):
+                    gcols = st.columns([5, 1])
+                    with gcols[0]:
+                        st.markdown(render_contact_card(p))
+                    with gcols[1]:
+                        if is_added:
+                            st.markdown("✓ Added")
+                        else:
+                            if st.button("+ Add", key=f"add_{r['id']}", use_container_width=True):
+                                with st.spinner("Loading…"):
+                                    tickets = get_contact_tickets(r["id"], hs_token)
+                                st.session_state.contacts.append({
+                                    "name": f"{p.get('firstname','')} {p.get('lastname','')}".strip() or "(no name)",
+                                    "agency": p.get("company") or st.session_state.group_agency,
+                                    "role": p.get("jobtitle","") or "",
+                                    "database": p.get("database_name","") or "",
+                                    "hs_id": r["id"],
+                                    "hs_data": r,
+                                    "hs_tickets": tickets,
+                                })
+                                st.rerun()
 
     # Manual add
     st.divider()
@@ -750,6 +804,7 @@ else:
                     "name": manual_name.strip(),
                     "agency": st.session_state.group_agency,
                     "role": manual_role.strip(),
+                    "database": "",
                     "hs_id": None,
                     "hs_data": None,
                 })
@@ -766,7 +821,8 @@ else:
             with cols[0]:
                 hs_tag = " 🟢 HubSpot" if c.get("hs_id") else ""
                 role_part = f" · {c['role']}" if c.get("role") else ""
-                st.markdown(f"**{c['name']}**{role_part}{hs_tag}")
+                db_part = f" · 🗄 {c['database']}" if c.get("database") else ""
+                st.markdown(f"**{c['name']}**{role_part}{db_part}{hs_tag}")
             with cols[1]:
                 if st.button("Remove", key=f"rm_{idx}", use_container_width=True):
                     st.session_state.contacts.pop(idx)
@@ -988,8 +1044,12 @@ if hs_contacts:
             if p.get("email"): st.markdown(f"✉️ {p['email']}")
             if p.get("phone"): st.markdown(f"📞 {p['phone']}")
         with col2:
-            if p.get("company"):  st.markdown(f"🏢 {p['company']}")
-            if p.get("jobtitle"): st.markdown(f"💼 {p['jobtitle']}")
+            if p.get("company"):       st.markdown(f"🏢 {p['company']}")
+            if p.get("jobtitle"):      st.markdown(f"💼 {p['jobtitle']}")
+            if p.get("database_name"): st.markdown(f"🗄 **DB:** {p['database_name']}")
+            if p.get("ikn__c"):        st.markdown(f"🔢 **IKN:** {p['ikn__c']}")
+            if p.get("childplus_license_number"):
+                st.markdown(f"🪪 **License:** {p['childplus_license_number']}")
             st.markdown(f"[Open in HubSpot ↗]({hs.get('url', '#')})")
         st.markdown("</div>", unsafe_allow_html=True)
 
