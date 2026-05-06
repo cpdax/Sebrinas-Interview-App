@@ -637,13 +637,42 @@ def init_state():
 init_state()
 
 
+# State keys we own and clear on reset. Anything NOT in this list is left alone —
+# critically, this preserves the streamlit-cookies-manager component's internal
+# session state, which is required for the cookie auth to keep working across
+# resets. Wholesale nuking st.session_state breaks the cookie component.
+_MANAGED_STATE_KEYS = [
+    "destination", "mode", "session_id", "contacts",
+    "solo_search_run", "solo_results", "solo_hs_id", "solo_hs_data", "solo_hs_tickets",
+    "group_search_run", "group_results", "group_agency",
+    "group_manual_name", "group_manual_role",
+    "event_source", "notes", "tags",
+    "submitted", "last_entry",
+    "solo_name", "solo_agency", "solo_role", "solo_database",
+    "pending_transcript", "recorder_counter",
+    "new_tag_input", "transcript_review_text",
+    "hs_view_picker", "existing_tag_picker",
+]
+
+# Dynamic widget keys we generate at runtime (note_text_0, note_text_1, ...,
+# pick_procare, use_<contact_id>, rm_<idx>, etc). Match by prefix.
+_MANAGED_KEY_PREFIXES = ("note_text_", "rm_note_", "rm_tag_", "clr_", "use_", "add_", "rm_")
+
+
+def _clear_managed_state():
+    """Delete only the session-state keys we own — leave Streamlit component
+    internals (especially the cookie manager) untouched."""
+    keys = list(st.session_state.keys())
+    for k in keys:
+        if k in _MANAGED_STATE_KEYS or k.startswith(_MANAGED_KEY_PREFIXES):
+            del st.session_state[k]
+
+
 def reset_all():
     """Reset capture state but preserve auth — Sebrina shouldn't have to log in
     again just because she finished one capture."""
     keep_authenticated = st.session_state.get("password_correct", False)
-    keys = list(st.session_state.keys())
-    for k in keys:
-        del st.session_state[k]
+    _clear_managed_state()
     init_state()
     if keep_authenticated:
         st.session_state.password_correct = True
@@ -651,13 +680,15 @@ def reset_all():
 
 def _sign_out():
     """Sign out: clear the auth cookie and reset everything. User returns to
-    the password gate on next render."""
+    the password gate on next render. Same caveat as reset_all — only touch
+    keys we own so the cookie component keeps working."""
     if cookies is not None:
         cookies[COOKIE_AUTH_KEY] = ""
         cookies.save()
-    keys = list(st.session_state.keys())
-    for k in keys:
-        del st.session_state[k]
+    _clear_managed_state()
+    # Also flip the auth flag off explicitly
+    if "password_correct" in st.session_state:
+        del st.session_state["password_correct"]
 
 
 def build_solo_contact() -> dict:
