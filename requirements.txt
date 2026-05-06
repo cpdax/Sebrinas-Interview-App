@@ -1,4 +1,0 @@
-streamlit>=1.33.0
-requests>=2.31.0
-msal>=1.28.0
-streamlit-mic-recorder>=0.0.8

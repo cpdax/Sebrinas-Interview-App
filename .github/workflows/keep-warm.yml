@@ -1,0 +1,26 @@
+name: Keep Streamlit App Warm
+
+# Pings the Sebrina's Interview App every 10 minutes during business hours
+# to prevent Streamlit Community Cloud from putting it to sleep, which makes
+# the first hit of the day slow (cold start = 30-90 seconds).
+#
+# Schedule covers both ET and PT for travel:
+#   - 13:00 UTC = 9 AM EDT / 6 AM PDT
+#   - 23:00 UTC = 7 PM EDT / 4 PM PDT
+#   - Edge case: 4 PM PST in winter (= 00:00 UTC next day) gets one cold start.
+#     Acceptable.
+# Skips weekends entirely.
+
+on:
+  schedule:
+    - cron: '*/10 13-23 * * 1-5'
+  workflow_dispatch:  # allows manual trigger from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping app
+        run: |
+          curl -sSf -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n" \
+            https://sebrinas-interview-app-4gdpnwaladvrvdh6cadca9.streamlit.app/

@@ -6,6 +6,13 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from streamlit_mic_recorder import speech_to_text
 
+# Cookie manager — gracefully handles missing dependency
+try:
+    from streamlit_cookies_manager import EncryptedCookieManager
+    COOKIES_AVAILABLE = True
+except ImportError:
+    COOKIES_AVAILABLE = False
+
 # ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
@@ -16,6 +23,11 @@ HS_BASE             = "https://api.hubapi.com"
 TICKET_DAYS         = 90
 TICKET_MAX          = 5
 TAG_SIMILARITY      = 0.75  # Retained for future use; tag autocomplete is OFF in stopgap.
+
+# Cookie auth — sliding 30-day expiry. Each visit resets the clock.
+COOKIE_AUTH_KEY     = "auth_expires"
+COOKIE_LIFETIME     = timedelta(days=30)
+COOKIE_PREFIX       = "customer_notes/"
 
 # HubSpot is only used for ChildPlus. Procare contacts are captured manually.
 HS_DESTINATION = "ChildPlus"
@@ -58,12 +70,8 @@ FULL_TABLE_HEADERS = [
     "SessionID",
 ]
 
-# Marker used to detect whether a page already has the two-table layout.
-# Match against the substring inside the macro tag (insensitive to attribute
-# order, since Confluence may reorder ac:name vs ac:schema-version on save).
 EXPAND_MACRO_MARKER = 'ac:name="expand"'
 
-# SharePoint list names — kept here for future migration but not actively used.
 NOTES_LIST_NAME = {"Procare": "PROCARE_NOTES_LIST", "ChildPlus": "CHILDPLUS_NOTES_LIST"}
 TAGS_LIST_NAME  = {"Procare": "PROCARE_TAGS_LIST",  "ChildPlus": "CHILDPLUS_TAGS_LIST"}
 
@@ -255,8 +263,6 @@ def update_confluence_page(cfg: dict, page_id: str, title: str, new_storage: str
 
 
 def _cell_content(text: str) -> str:
-    """Escape a value for safe inclusion in a Confluence storage <td>.
-    Newlines become <br/> so multi-line note text renders as expected."""
     if not text:
         return ""
     return html.escape(str(text), quote=False).replace("\n", "<br/>")
@@ -271,8 +277,6 @@ def _build_data_row(values: list[str]) -> str:
 
 
 def _bootstrap_two_tables(summary_rows_html: str, full_rows_html: str) -> str:
-    """Build the initial page structure: summary table on top, full-detail table
-    inside an Expand macro that's collapsed by default."""
     summary_table = (
         "<h3>Summary</h3>"
         "<table><tbody>"
@@ -295,36 +299,19 @@ def _bootstrap_two_tables(summary_rows_html: str, full_rows_html: str) -> str:
 
 
 def _append_rows_to_storage(storage: str, summary_rows_html: str, full_rows_html: str) -> str | None:
-    """Insert new rows into both the summary and full tables in one storage update.
-
-    Layout invariant after bootstrap:
-      <h3>Summary</h3><table>...summary tbody...</table>
-      <ac:structured-macro name=expand>
-        <ac:rich-text-body><table>...full tbody...</table></ac:rich-text-body>
-      </ac:structured-macro>
-
-    Returns the new storage string, or None if the page structure is malformed
-    (which causes the caller to fall back to CSV).
-    """
     if EXPAND_MACRO_MARKER not in storage:
-        # Page hasn't been initialized with the two-table layout yet — bootstrap.
-        # Existing page content (description text, etc.) above is preserved.
         return storage + _bootstrap_two_tables(summary_rows_html, full_rows_html)
 
     expand_idx = storage.find(EXPAND_MACRO_MARKER)
 
-    # Summary tbody close = the last </tbody> on the page BEFORE the expand macro
     summary_close = storage.rfind("</tbody>", 0, expand_idx)
     if summary_close == -1:
         return None
 
-    # Full tbody close = the last </tbody> on the page (inside the expand macro)
     full_close = storage.rfind("</tbody>")
     if full_close <= summary_close:
         return None
 
-    # Splice both new row blocks in at once. Indices stay valid because we
-    # rebuild the string from segments rather than mutating in place.
     return (
         storage[:summary_close]
         + summary_rows_html
@@ -335,8 +322,6 @@ def _append_rows_to_storage(storage: str, summary_rows_html: str, full_rows_html
 
 
 def save_session_to_confluence(session_data: dict) -> tuple[bool, str]:
-    """Append a row per note to BOTH the summary table and the full-detail table
-    on the destination's Confluence page."""
     cfg = get_confluence_config()
     if not cfg:
         return False, "confluence_not_configured"
@@ -361,19 +346,17 @@ def save_session_to_confluence(session_data: dict) -> tuple[bool, str]:
     summary_rows_html = ""
     full_rows_html    = ""
     for idx, note in enumerate(notes, start=1):
-        # Summary row — the at-a-glance set
         summary_values = [
-            session_data["submitted_at"],         # SubmittedAt
-            primary.get("name", ""),              # PrimaryContact
-            primary.get("agency", ""),            # PrimaryAgency
-            note["text"],                         # NoteText
-            ", ".join(session_data["tags"]),      # Tags
-            session_data["event_source"],         # EventSource
-            session_data["session_type"],         # SessionType
+            session_data["submitted_at"],
+            primary.get("name", ""),
+            primary.get("agency", ""),
+            note["text"],
+            ", ".join(session_data["tags"]),
+            session_data["event_source"],
+            session_data["session_type"],
         ]
         summary_rows_html += _build_data_row(summary_values)
 
-        # Full-detail row — every column for export/audit
         full_values = [
             session_data["submitted_at"],
             primary.get("name", ""),
@@ -439,7 +422,7 @@ def get_graph_token(cfg: dict) -> str | None:
 
 
 # ─────────────────────────────────────────────
-# CONTACT BLOB FORMATTER (used by Confluence rows + CSV fallback)
+# CONTACT BLOB FORMATTER
 # ─────────────────────────────────────────────
 
 def format_contacts_blob(contacts: list[dict]) -> str:
@@ -512,8 +495,51 @@ st.markdown("""
   .success-banner { background:#d1e7dd; color:#0f5132; padding:16px; border-radius:10px; text-align:center; font-weight:600; }
   .fallback-banner { background:#fff3cd; color:#664d03; padding:12px; border-radius:8px; font-size:13px; }
   .mode-label { font-size:12px; color:#6c757d; text-transform:uppercase; letter-spacing:0.05em; font-weight:600; }
+  /* Sign-out footer link — quiet, findable, non-interfering */
+  .signout-footer { text-align:center; margin-top:40px; padding-top:20px;
+    border-top:1px solid #e9ecef; opacity:0.6; }
+  .signout-footer button {
+    background:transparent; color:#6c757d; border:none; font-size:12px;
+    cursor:pointer; padding:4px 12px; }
+  .signout-footer button:hover { color:#212529; text-decoration:underline; }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+# COOKIE AUTH
+# Persists the password gate across browser sessions. 30-day sliding expiry —
+# every visit refreshes the clock. If COOKIE_PASSWORD secret is missing or the
+# library fails to import, we silently fall back to per-session password gate.
+# ─────────────────────────────────────────────
+
+def _init_cookies():
+    """Initialize cookie manager. Returns the manager or None if unavailable.
+    Called once at startup. Never raises — auth gracefully degrades if cookies
+    can't be set up (e.g. missing dependency, missing secret, browser disabled
+    cookies)."""
+    if not COOKIES_AVAILABLE:
+        return None
+    try:
+        password = st.secrets.get("COOKIE_PASSWORD")
+    except (KeyError, FileNotFoundError):
+        password = None
+    if not password:
+        return None
+    try:
+        mgr = EncryptedCookieManager(prefix=COOKIE_PREFIX, password=password)
+        if not mgr.ready():
+            # Component still loading on the browser side. Stop the script and
+            # let Streamlit re-run when cookies are available. This is REQUIRED
+            # by the library — without st.stop(), reads return stale data.
+            st.stop()
+        return mgr
+    except Exception:
+        # Any cookie setup failure → fall back to session-only auth.
+        return None
+
+
+cookies = _init_cookies()
 
 
 # ─────────────────────────────────────────────
@@ -521,8 +547,31 @@ st.markdown("""
 # ─────────────────────────────────────────────
 
 def show_password_gate():
+    """Three-state gate: (1) already authed in this session → return immediately;
+    (2) valid auth cookie present → set session flag, refresh expiry, return;
+    (3) otherwise → show password input."""
     if st.session_state.get("password_correct"):
         return
+
+    # Cookie path — defensively wrapped so any cookie failure falls through to
+    # the password prompt instead of crashing the app
+    if cookies is not None:
+        try:
+            expires_str = cookies[COOKIE_AUTH_KEY] if COOKIE_AUTH_KEY in cookies else None
+        except Exception:
+            expires_str = None
+        if expires_str:
+            try:
+                expires = datetime.fromisoformat(expires_str)
+                if datetime.now() < expires:
+                    # Valid — slide the expiry forward and let user in
+                    cookies[COOKIE_AUTH_KEY] = (datetime.now() + COOKIE_LIFETIME).isoformat()
+                    cookies.save()
+                    st.session_state.password_correct = True
+                    return
+            except (ValueError, TypeError):
+                pass  # Bad cookie format; fall through to password prompt
+
     try:
         expected = st.secrets["APP_PASSWORD"]
     except (KeyError, FileNotFoundError):
@@ -536,6 +585,10 @@ def show_password_gate():
     if pw:
         if pw == expected:
             st.session_state.password_correct = True
+            # Set cookie if available — gives 30 days of persistent auth
+            if cookies is not None:
+                cookies[COOKIE_AUTH_KEY] = (datetime.now() + COOKIE_LIFETIME).isoformat()
+                cookies.save()
             st.rerun()
         else:
             st.error("Incorrect password.")
@@ -585,6 +638,8 @@ init_state()
 
 
 def reset_all():
+    """Reset capture state but preserve auth — Sebrina shouldn't have to log in
+    again just because she finished one capture."""
     keep_authenticated = st.session_state.get("password_correct", False)
     keys = list(st.session_state.keys())
     for k in keys:
@@ -592,6 +647,17 @@ def reset_all():
     init_state()
     if keep_authenticated:
         st.session_state.password_correct = True
+
+
+def _sign_out():
+    """Sign out: clear the auth cookie and reset everything. User returns to
+    the password gate on next render."""
+    if cookies is not None:
+        cookies[COOKIE_AUTH_KEY] = ""
+        cookies.save()
+    keys = list(st.session_state.keys())
+    for k in keys:
+        del st.session_state[k]
 
 
 def build_solo_contact() -> dict:
@@ -696,9 +762,7 @@ def _add_tag():
     st.session_state.new_tag_input = ""
 
 
-# ─────────────────────────────────────────────
-# HEADER
-# ─────────────────────────────────────────────
+
 
 st.title("🎤 Customer Notes")
 
@@ -1222,3 +1286,12 @@ if hs_available:
                             st.markdown(f'<span class="ticket-meta">Priority: {pri.title()}</span>', unsafe_allow_html=True)
                         if snip: st.markdown(snip)
                         st.markdown(f"[View in HubSpot ↗]({t.get('url','#')})")
+
+
+# ─────────────────────────────────────────────
+# SIGN-OUT FOOTER (always last)
+# ─────────────────────────────────────────────
+
+st.markdown('<div class="signout-footer">', unsafe_allow_html=True)
+st.button("Sign out", key="signout_btn", on_click=_sign_out)
+st.markdown('</div>', unsafe_allow_html=True)
